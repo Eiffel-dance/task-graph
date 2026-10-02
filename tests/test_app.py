@@ -220,5 +220,146 @@ class ExecutionFailureTest(unittest.TestCase):
         self.assertIs(g.run()["o"], marker)
 
 
+class RetryTest(unittest.TestCase):
+    def test_default_and_zero_call_each_task_once(self):
+        for kwargs in ({}, {"max_retries": 0}):
+            calls = []
+
+            def flaky(r):
+                calls.append(1)
+                raise RuntimeError("always")
+
+            g = TaskGraph()
+            g.add("f", flaky)
+            with self.assertRaises(TaskExecutionError):
+                g.run(**kwargs)
+            self.assertEqual(len(calls), 1)
+
+    def test_transient_failure_recovers_within_same_run(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise RuntimeError("transient %d" % attempts["n"])
+            return "ok"
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        g.add("down", lambda r: r["flaky"] + "!", depends=["flaky"])
+        self.assertEqual(g.run(max_retries=2), {"flaky": "ok", "down": "ok!"})
+        self.assertEqual(attempts["n"], 3)
+        state = g.execution_state()
+        self.assertEqual(
+            state["flaky"], {"status": "completed", "result": "ok", "error": None}
+        )
+        self.assertEqual(state["down"]["status"], "completed")
+
+    def test_retry_budget_is_per_task(self):
+        fails = {"a": 1, "b": 1}
+
+        def make(name):
+            def task(r):
+                if fails[name]:
+                    fails[name] -= 1
+                    raise RuntimeError(name)
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a"))
+        g.add("b", make("b"), depends=["a"])
+        # Each task fails once; a shared budget of 1 would not suffice.
+        self.assertEqual(g.run(max_retries=1), {"a": "a", "b": "b"})
+
+    def test_exhaustion_reports_last_exception_and_skips_downstream(self):
+        calls_down = []
+
+        def flaky(r):
+            raise ValueError("attempt fails")
+
+        g = TaskGraph()
+        g.add("up", lambda r: 1)
+        g.add("flaky", flaky, depends=["up"])
+        g.add("down", lambda r: calls_down.append(1), depends=["flaky"])
+
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_retries=2)
+        err = ctx.exception
+        self.assertEqual(err.task_name, "flaky")
+        self.assertIs(err.__cause__, err.original)
+        self.assertIsInstance(err.original, ValueError)
+        self.assertEqual(str(err.original), "attempt fails")
+        self.assertEqual(calls_down, [])
+
+        state = g.execution_state()
+        self.assertEqual(state["up"]["status"], "completed")
+        self.assertEqual(state["flaky"]["status"], "failed")
+        self.assertEqual(
+            state["flaky"]["error"],
+            {"type": "ValueError", "message": "attempt fails"},
+        )
+        self.assertEqual(state["down"]["status"], "pending")
+
+    def test_exhaustion_keeps_last_of_differing_exceptions(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            raise RuntimeError("failure %d" % attempts["n"])
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_retries=1)
+        self.assertEqual(str(ctx.exception.original), "failure 2")
+        self.assertEqual(
+            g.execution_state()["flaky"]["error"],
+            {"type": "RuntimeError", "message": "failure 2"},
+        )
+
+    def test_each_attempt_gets_fresh_input_mapping(self):
+        seen = []
+        raw = []
+
+        def dep(r):
+            return 1
+
+        def flaky(r):
+            raw.append(r)
+            seen.append(dict(r))
+            r["polluted"] = True
+            if len(seen) == 1:
+                raise RuntimeError("once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("dep", dep)
+        g.add("flaky", flaky, depends=["dep"])
+        self.assertEqual(g.run(max_retries=1)["flaky"], "ok")
+        self.assertEqual(len(seen), 2)
+        self.assertIsNot(raw[0], raw[1])  # each attempt gets a new mapping
+        self.assertEqual(seen[0], {"dep": 1})
+        self.assertEqual(seen[1], {"dep": 1})  # first attempt's mutation unseen
+
+    def test_invalid_max_retries_rejected_before_any_execution(self):
+        for bad in (-1, True, False, 1.5, "2", None):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(ValueError):
+                g.run(max_retries=bad)
+            self.assertEqual(calls, [1])  # nothing executed on the bad call
+            self.assertEqual(g.execution_state(), before)
+
+    def test_invalid_max_retries_with_empty_graph(self):
+        g = TaskGraph()
+        with self.assertRaises(ValueError):
+            g.run(max_retries=-2)
+        self.assertEqual(g.execution_state(), {})
+
+
 if __name__ == "__main__":
     unittest.main()

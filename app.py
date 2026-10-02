@@ -74,7 +74,15 @@ class TaskGraph:
             snapshot[name] = entry
         return snapshot
 
-    def run(self):
+    def run(self, max_retries=0):
+        # max_retries is the number of extra attempts granted to each task
+        # after its first failure; zero (the default) keeps the historical
+        # single-call behavior. Booleans are rejected even though they are
+        # ints, since True/False is never a meaningful retry count.
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise ValueError("max_retries must be a non-negative integer")
+        if max_retries < 0:
+            raise ValueError("max_retries must be a non-negative integer")
         # Validate before touching any state: a missing dependency must
         # neither execute tasks nor discard a previous run's snapshot.
         order = self.order()
@@ -87,18 +95,25 @@ class TaskGraph:
         results = {}
         for name in order:
             state[name]["status"] = "running"
-            # Each task receives a brand-new mapping containing only its
-            # declared upstream values; ordering keys keeps calls reproducible.
-            inputs = {d: results[d] for d in sorted(self.deps[name])}
-            try:
-                value = self.tasks[name](inputs)
-            except Exception as exc:
-                state[name]["status"] = "failed"
-                state[name]["error"] = {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                }
-                raise TaskExecutionError(name, exc) from exc
+            # Retry budgets are per task: every task gets its own
+            # max_retries extra attempts regardless of upstream outcomes.
+            for attempt in range(max_retries + 1):
+                # Each attempt receives a brand-new mapping containing only
+                # its declared upstream values; ordering keys keeps calls
+                # reproducible.
+                inputs = {d: results[d] for d in sorted(self.deps[name])}
+                try:
+                    value = self.tasks[name](inputs)
+                except Exception as exc:
+                    if attempt < max_retries:
+                        continue  # retry the same task immediately
+                    state[name]["status"] = "failed"
+                    state[name]["error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                    raise TaskExecutionError(name, exc) from exc
+                break
             state[name]["status"] = "completed"
             state[name]["result"] = value
             results[name] = value
