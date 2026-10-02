@@ -1,4 +1,5 @@
 from collections import defaultdict, deque
+from collections.abc import Iterable
 
 
 class TaskExecutionError(Exception):
@@ -24,10 +25,29 @@ class TaskGraph:
         self._state = {}
 
     def add(self, name, fn, depends=()):
+        # Validate everything before touching tasks/deps so an invalid
+        # registration never leaves a partial node behind.
+        if not isinstance(name, str):
+            raise TypeError("task name must be a string")
+        if name == "":
+            raise ValueError("task name must not be empty")
+        if not callable(fn):
+            raise TypeError("task function must be callable")
+        # Strings, bytes and other non-iterables are not dependency sets;
+        # iterating a string would silently turn "ab" into {"a", "b"}.
+        if isinstance(depends, (str, bytes)) or not isinstance(depends, Iterable):
+            raise TypeError("depends must be an iterable of task names")
+        dep_names = set()
+        for dep in depends:
+            if not isinstance(dep, str):
+                raise TypeError("dependency name must be a string")
+            if dep == "":
+                raise ValueError("dependency name must not be empty")
+            dep_names.add(dep)
         if name in self.tasks:
             raise ValueError("duplicate task")
         self.tasks[name] = fn
-        self.deps[name] = set(depends)
+        self.deps[name] = dep_names
 
     def _check_dependencies(self):
         # Dependencies may be registered after the task that names them,
