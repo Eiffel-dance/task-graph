@@ -138,6 +138,96 @@ class InputBoundaryTest(unittest.TestCase):
         self.assertEqual(list(g.run()), ["a", "b", "c"])
 
 
+class RegistrationValidationTest(unittest.TestCase):
+    def test_non_string_task_name(self):
+        for bad in (None, 1, 1.5, b"x", ("x",), ["x"]):
+            g = TaskGraph()
+            with self.assertRaises(TypeError) as ctx:
+                g.add(bad, lambda r: None)
+            self.assertEqual(str(ctx.exception), "task name must be a string")
+            self.assertEqual(g.tasks, {})
+            self.assertEqual(g.execution_state(), {})
+
+    def test_empty_task_name(self):
+        g = TaskGraph()
+        with self.assertRaises(ValueError) as ctx:
+            g.add("", lambda r: None)
+        self.assertEqual(str(ctx.exception), "task name must not be empty")
+        self.assertEqual(g.tasks, {})
+
+    def test_non_callable_task_function(self):
+        for bad in (None, 1, "fn", object()):
+            g = TaskGraph()
+            with self.assertRaises(TypeError) as ctx:
+                g.add("t", bad)
+            self.assertEqual(str(ctx.exception), "task function must be callable")
+            self.assertEqual(g.tasks, {})
+
+    def test_depends_must_be_iterable_of_names(self):
+        for bad in ("dep", b"dep", 1, None, object()):
+            g = TaskGraph()
+            with self.assertRaises(TypeError) as ctx:
+                g.add("t", lambda r: None, depends=bad)
+            self.assertEqual(
+                str(ctx.exception), "depends must be an iterable of task names"
+            )
+            self.assertEqual(g.tasks, {})
+
+    def test_non_string_dependency_name(self):
+        for bad in ([1], (None,), [b"x"], ["ok", 2]):
+            g = TaskGraph()
+            with self.assertRaises(TypeError) as ctx:
+                g.add("t", lambda r: None, depends=bad)
+            self.assertEqual(
+                str(ctx.exception), "dependency name must be a string"
+            )
+            self.assertEqual(g.tasks, {})
+
+    def test_empty_dependency_name(self):
+        g = TaskGraph()
+        with self.assertRaises(ValueError) as ctx:
+            g.add("t", lambda r: None, depends=["ok", ""])
+        self.assertEqual(
+            str(ctx.exception), "dependency name must not be empty"
+        )
+        self.assertEqual(g.tasks, {})
+
+    def test_failed_validation_preserves_existing_graph_and_state(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7)
+        self.assertEqual(g.run(), {"ok": 7})
+        before = g.execution_state()
+        for call in (
+            lambda: g.add(None, lambda r: None),
+            lambda: g.add("", lambda r: None),
+            lambda: g.add("bad", None),
+            lambda: g.add("bad", lambda r: None, depends="x"),
+            lambda: g.add("bad", lambda r: None, depends=[1]),
+            lambda: g.add("bad", lambda r: None, depends=[""]),
+        ):
+            with self.assertRaises((TypeError, ValueError)):
+                call()
+        self.assertEqual(set(g.tasks), {"ok"})
+        self.assertEqual(g.order(), ["ok"])
+        self.assertEqual(g.execution_state(), before)
+        self.assertEqual(g.run(), {"ok": 7})
+
+    def test_generator_depends_and_duplicate_dep_collapse(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, depends=(d for d in ["a", "a"]))
+        self.assertEqual(g.order(), ["a", "b"])
+        self.assertEqual(g.run(), {"a": 1, "b": 2})
+
+    def test_duplicate_check_still_applies_after_validation(self):
+        g = TaskGraph()
+        g.add("x", lambda r: None)
+        with self.assertRaises(ValueError) as ctx:
+            g.add("x", lambda r: None, depends=["y"])
+        self.assertIn("duplicate task", str(ctx.exception))
+        self.assertNotIn("y", g.deps["x"])
+
+
 class ExecutionFailureTest(unittest.TestCase):
     def test_failure_wrapped_with_cause_and_details(self):
         g = TaskGraph()

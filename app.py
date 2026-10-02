@@ -24,10 +24,33 @@ class TaskGraph:
         self._state = {}
 
     def add(self, name, fn, depends=()):
+        # Validate everything before mutating anything: a rejected
+        # registration must leave tasks, deps and execution_state untouched.
+        if not isinstance(name, str):
+            raise TypeError("task name must be a string")
+        if not name:
+            raise ValueError("task name must not be empty")
+        if not callable(fn):
+            raise TypeError("task function must be callable")
+        # Strings and bytes are iterable but are never a collection of
+        # dependency names, so reject them explicitly.
+        if isinstance(depends, (str, bytes)):
+            raise TypeError("depends must be an iterable of task names")
+        try:
+            dep_names = list(depends)
+        except TypeError:
+            raise TypeError(
+                "depends must be an iterable of task names"
+            ) from None
+        for dep in dep_names:
+            if not isinstance(dep, str):
+                raise TypeError("dependency name must be a string")
+            if not dep:
+                raise ValueError("dependency name must not be empty")
         if name in self.tasks:
             raise ValueError("duplicate task")
         self.tasks[name] = fn
-        self.deps[name] = set(depends)
+        self.deps[name] = set(dep_names)
 
     def _check_dependencies(self):
         # Dependencies may be registered after the task that names them,
