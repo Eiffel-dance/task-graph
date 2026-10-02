@@ -74,7 +74,18 @@ class TaskGraph:
             snapshot[name] = entry
         return snapshot
 
-    def run(self):
+    def run(self, max_retries=0):
+        # Validate the retry option before anything else: an invalid value
+        # must abort before graph validation/task execution and must not
+        # discard a previous run's snapshot. bool is a subclass of int, so
+        # reject it explicitly.
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or max_retries < 0
+        ):
+            raise ValueError("max_retries must be a non-negative integer")
+
         # Validate before touching any state: a missing dependency must
         # neither execute tasks nor discard a previous run's snapshot.
         order = self.order()
@@ -86,19 +97,31 @@ class TaskGraph:
         self._state = state
         results = {}
         for name in order:
-            state[name]["status"] = "running"
-            # Each task receives a brand-new mapping containing only its
-            # declared upstream values; ordering keys keeps calls reproducible.
-            inputs = {d: results[d] for d in sorted(self.deps[name])}
-            try:
-                value = self.tasks[name](inputs)
-            except Exception as exc:
+            # The retry budget is per task: each task gets one initial call
+            # plus up to max_retries immediate retries of that same task.
+            last_exc = None
+            value = None
+            for _attempt in range(max_retries + 1):
+                state[name]["status"] = "running"
+                # Each attempt receives a brand-new mapping containing only
+                # the task's declared upstream values; ordering keys keeps
+                # calls reproducible, including retries.
+                inputs = {d: results[d] for d in sorted(self.deps[name])}
+                try:
+                    value = self.tasks[name](inputs)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc is not None:
+                # Details and causal chain come from the final attempt;
+                # downstream tasks never run.
                 state[name]["status"] = "failed"
                 state[name]["error"] = {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
+                    "type": type(last_exc).__name__,
+                    "message": str(last_exc),
                 }
-                raise TaskExecutionError(name, exc) from exc
+                raise TaskExecutionError(name, last_exc) from last_exc
             state[name]["status"] = "completed"
             state[name]["result"] = value
             results[name] = value
