@@ -29,7 +29,20 @@ class TaskGraph:
         self.tasks[name] = fn
         self.deps[name] = set(depends)
 
+    def _check_dependencies(self):
+        # Dependencies may be registered after the task that names them,
+        # but by the time the graph is validated every name must resolve.
+        # With several missing references, report deterministically:
+        # smallest task name first, then its smallest missing dependency.
+        for name in sorted(self.deps):
+            missing = sorted(d for d in self.deps[name] if d not in self.tasks)
+            if missing:
+                raise KeyError(
+                    "task %r depends on missing task %r" % (name, missing[0])
+                )
+
     def order(self):
+        self._check_dependencies()
         deps = {k: set(v) for k, v in self.deps.items()}
         out = []
         q = deque(sorted(k for k, v in deps.items() if not v))
@@ -53,9 +66,17 @@ class TaskGraph:
         plus the result or error details; mutating the returned object
         does not affect the graph's internal state.
         """
-        return {name: dict(record) for name, record in self._state.items()}
+        snapshot = {}
+        for name, record in self._state.items():
+            entry = dict(record)
+            if entry["error"] is not None:
+                entry["error"] = dict(entry["error"])
+            snapshot[name] = entry
+        return snapshot
 
     def run(self):
+        # Validate before touching any state: a missing dependency must
+        # neither execute tasks nor discard a previous run's snapshot.
         order = self.order()
         # Fresh snapshot per run: no records leak from previous runs.
         state = {
@@ -66,8 +87,11 @@ class TaskGraph:
         results = {}
         for name in order:
             state[name]["status"] = "running"
+            # Each task receives a brand-new mapping containing only its
+            # declared upstream values; ordering keys keeps calls reproducible.
+            inputs = {d: results[d] for d in sorted(self.deps[name])}
             try:
-                value = self.tasks[name](results)
+                value = self.tasks[name](inputs)
             except Exception as exc:
                 state[name]["status"] = "failed"
                 state[name]["error"] = {
