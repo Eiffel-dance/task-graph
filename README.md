@@ -37,3 +37,11 @@ Tests: python3 -m unittest discover -s tests -v
 
 失败语义与顺序执行一致：`continue_on_error=False`（默认）时，若批次中有任务耗尽重试仍失败，调度器等待本批次已启动的任务收束后停止启动新节点，抛出稳定拓扑序中最早失败节点的 `TaskExecutionError`（`task_name`、`original`、`__cause__` 指向该节点最后一次尝试的原始异常）；失败节点记录 `failed` 及最后异常的 `type` 与 `message`，已完成节点保留结果，未启动及依赖失败的节点保持 `pending`。`continue_on_error=True` 时，独立可运行节点继续推进，直接或间接依赖失败节点的任务不被调用，全部可调度工作结束后仍报告稳定拓扑序中最早的失败；无失败时返回完整（或 `targets` 闭包内）的结果。
 
+## Execution plan
+
+`plan(targets=None)` 是只读的执行计划查询入口（`targets` 仅限关键字传入，位置参数语义不变）：省略或传 `None` 覆盖完整图，否则对任务名集合先去重、再纳入每个目标的全部传递依赖，结果是完整图稳定拓扑序在该闭包上的投影；目标没有依赖时只返回该目标。每次成功调用都返回全新列表，修改返回值不影响图本身或后续查询。
+
+`plan` 对 `targets` 的整体输入校验顺序与 `run` 完全一致，并在排序之前完成：字符串、bytes 或其他不可迭代对象、集合中的非字符串名称抛出 `TypeError`；空名称或空集合抛出 `ValueError`；引用不存在的任务抛出 `KeyError`。输入通过后仍对**整张图**完成缺失依赖（`KeyError`）与环（`ValueError`）校验，即使问题节点不在目标闭包内也不忽略。任何输入或图校验失败都不调用任务函数，也不创建或替换最近一次 `execution_state()` 快照；成功的 `plan` 不改变任务注册、依赖关系或执行状态。
+
+`plan` 的成功结果即 `run` 的调度契约：对同一份未变更图和同一组 `targets`，`plan` 返回列表与实际 `run` 采用的稳定任务序列、返回映射键顺序以及 `execution_state()` 记录顺序完全一致。该序列只由任务名称和依赖关系决定，不受注册先后、集合遍历、任务完成时序、`max_retries`、`continue_on_error` 或 `max_concurrency` 影响。`plan` 只负责预览，不执行任务，也不改变既有失败与并发语义。
+

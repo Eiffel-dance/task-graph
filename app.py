@@ -82,6 +82,50 @@ class TaskGraph:
             raise ValueError("cycle detected")
         return out
 
+    def plan(self, *, targets=None):
+        """Return the stable task sequence a run would adopt, without
+        running any task.
+
+        Omitting targets (or passing None) covers the whole graph;
+        otherwise the iterable of target names is de-duplicated, closed
+        over every transitive dependency, and projected onto the full
+        stable topological order. A target without dependencies yields a
+        one-element list. Every successful call returns a brand-new list.
+
+        Targets are validated with exactly run()'s input boundary,
+        before ordering, and the complete graph is still checked for
+        missing dependencies and cycles even when the bad nodes lie
+        outside the requested closure. plan() never calls a task
+        function and never touches registrations, dependencies or the
+        latest execution_state snapshot; the returned list is the
+        scheduling contract run() follows (its execution sequence,
+        result key order and state record order).
+        """
+        selected = None
+        if targets is not None:
+            selected = self._normalize_targets(targets)
+        # Always validate the complete graph: a missing dependency or
+        # cycle outside the requested closure must not be silently ignored.
+        order = self.order()
+        return self._project_closure(order, selected)
+
+    def _project_closure(self, order, selected):
+        # Shared by plan() and run() so a preview is literally the
+        # scheduler's sequence: project the full stable topological
+        # order onto the closure of the selected targets (each target
+        # plus all of its transitive dependencies). selected is None for
+        # the whole graph. A fresh list is always returned.
+        if selected is None:
+            return list(order)
+        closure = set()
+        stack = list(selected)
+        while stack:
+            name = stack.pop()
+            if name not in closure:
+                closure.add(name)
+                stack.extend(self.deps[name])
+        return [name for name in order if name in closure]
+
     def execution_state(self):
         """Return an independent snapshot of the most recent run, in
         stable topological order.
@@ -161,24 +205,11 @@ class TaskGraph:
             selected = self._normalize_targets(targets)
         # Always validate the complete graph, including unselected nodes:
         # a bad node outside the requested closure must not be silently
-        # accepted. order() also supplies the stable topological order whose
-        # projection determines actual execution order.
+        # accepted. order() also supplies the stable topological order;
+        # projecting it through the same closure helper plan() exposes
+        # makes the preview the exact scheduling contract below.
         order = self.order()
-        if selected is None:
-            run_order = order
-        else:
-            # Close the selected targets over their transitive dependencies,
-            # then project the full stable topological order onto that
-            # closure; every direct dependency of a closure node is itself
-            # in the closure, so inputs are identical to a whole-graph run.
-            closure = set()
-            stack = list(selected)
-            while stack:
-                name = stack.pop()
-                if name not in closure:
-                    closure.add(name)
-                    stack.extend(self.deps[name])
-            run_order = [name for name in order if name in closure]
+        run_order = self._project_closure(order, selected)
         # Fresh snapshot per run covering exactly the executed closure:
         # no records leak from previous runs or from unselected nodes.
         state = {

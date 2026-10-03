@@ -1246,5 +1246,158 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertIn("cycle detected", str(ctx.exception))
 
 
+class PlanTest(unittest.TestCase):
+    def _diamond(self):
+        # order(): a, c, b, d, e (Kahn with the smallest ready name).
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.add("c", lambda r: 10)
+        g.add("d", lambda r: r["b"] + r["c"], ["b", "c"])
+        g.add("e", lambda r: r["d"] + 1, ["d"])
+        return g
+
+    def test_plan_whole_graph_matches_order(self):
+        g = self._diamond()
+        self.assertEqual(g.plan(), ["a", "c", "b", "d", "e"])
+        self.assertEqual(g.plan(targets=None), ["a", "c", "b", "d", "e"])
+        self.assertEqual(g.plan(), g.order())
+
+    def test_plan_targets_is_projection_of_full_order(self):
+        g = self._diamond()
+        self.assertEqual(g.plan(targets=["d"]), ["a", "c", "b", "d"])
+        self.assertEqual(g.plan(targets=["e", "b"]), ["a", "c", "b", "d", "e"])
+
+    def test_plan_duplicate_targets_collapse(self):
+        g = self._diamond()
+        self.assertEqual(g.plan(targets=["b", "b", "b"]), ["a", "b"])
+
+    def test_plan_target_without_dependencies_is_alone(self):
+        g = self._diamond()
+        self.assertEqual(g.plan(targets=["c"]), ["c"])
+
+    def test_plan_accepts_any_iterable_including_generators(self):
+        g = self._diamond()
+        self.assertEqual(g.plan(targets=(t for t in ["b"])), ["a", "b"])
+
+    def test_plan_targets_is_keyword_only(self):
+        g = self._diamond()
+        with self.assertRaises(TypeError):
+            g.plan(["b"])
+
+    def test_plan_returns_fresh_list_each_call(self):
+        g = self._diamond()
+        first = g.plan()
+        second = g.plan(targets=["d"])
+        self.assertIsNot(first, g.plan())
+        self.assertIsNot(second, g.plan(targets=["d"]))
+        first.append("tampered")
+        second[0] = "tampered"
+        self.assertEqual(g.plan(), ["a", "c", "b", "d", "e"])
+        self.assertEqual(g.plan(targets=["d"]), ["a", "c", "b", "d"])
+
+    def test_plan_does_not_run_tasks_or_touch_state(self):
+        calls = []
+
+        def boom(r):
+            calls.append("boom")
+            raise RuntimeError("must never run")
+
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", boom, ["a"])
+        g.run(targets=["a"])
+        before = g.execution_state()
+        # Previewing the closure that contains the failing task runs nothing.
+        self.assertEqual(g.plan(targets=["b"]), ["a", "b"])
+        self.assertEqual(g.plan(), ["a", "b"])
+        self.assertEqual(calls, ["a"])
+        self.assertEqual(g.execution_state(), before)
+        # Registrations and dependencies are unchanged.
+        self.assertEqual(set(g.tasks), {"a", "b"})
+        self.assertEqual(set(g.deps["b"]), {"a"})
+
+    def test_plan_validation_error_does_not_touch_snapshot(self):
+        g = self._diamond()
+        g.run(targets=["b"])
+        before = g.execution_state()
+        self.assertEqual(set(before), {"a", "b"})
+        for bad in ("b", b"b", 1, 1.5, 0, object()):
+            with self.assertRaises(TypeError):
+                g.plan(targets=bad)
+        for bad in (["b", 1], (None,), [b"x"], [[]]):
+            with self.assertRaises(TypeError):
+                g.plan(targets=bad)
+        for bad in ([""], ["b", ""], [], set(), ()):
+            with self.assertRaises(ValueError):
+                g.plan(targets=bad)
+        for bad in (["ghost"], ["b", "ghost"]):
+            with self.assertRaises(KeyError):
+                g.plan(targets=bad)
+        self.assertEqual(g.execution_state(), before)
+
+    def test_plan_validates_whole_graph_even_outside_closure(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: 2, ["a"])
+        g.add("z", lambda r: None, ["missing"])
+        with self.assertRaises(KeyError):
+            g.plan(targets=["b"])
+        self.assertEqual(g.execution_state(), {})
+
+        g2 = TaskGraph()
+        g2.add("a", lambda r: None, ["b"])
+        g2.add("b", lambda r: None, ["a"])
+        g2.add("ok", lambda r: 1)
+        with self.assertRaises(ValueError) as ctx:
+            g2.plan(targets=["ok"])
+        self.assertIn("cycle detected", str(ctx.exception))
+        self.assertEqual(g2.execution_state(), {})
+
+    def test_plan_is_the_run_scheduling_contract(self):
+        import time
+
+        def slow_a(r):
+            time.sleep(0.05)
+            return "a"
+
+        g = TaskGraph()
+        g.add("a", slow_a)
+        g.add("c", lambda r: "c")
+        g.add("b", lambda r: "b", ["a"])
+        g.add("d", lambda r: r["b"] + r["c"], ["b", "c"])
+        g.add("e", lambda r: r["d"] + "e", ["d"])
+
+        for kwargs in (
+            {},
+            {"targets": ["e", "b"]},
+            {"targets": ["d"], "max_concurrency": 3},
+            {"max_concurrency": 2},
+            {"max_retries": 1, "continue_on_error": True,
+             "max_concurrency": 2, "targets": ["e"]},
+        ):
+            plan_kwargs = {
+                "targets": kwargs.get("targets")
+            }
+            expected = g.plan(**plan_kwargs)
+            results = g.run(**kwargs)
+            self.assertEqual(list(results), expected)
+            self.assertEqual(list(g.execution_state()), expected)
+
+    def test_plan_contract_holds_under_registration_order_and_set_input(self):
+        # Register dependents before dependencies and feed targets as a set;
+        # the sequence must still be name/dependency determined.
+        g = TaskGraph()
+        g.add("d", lambda r: r["b"] + r["c"], ["b", "c"])
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.add("c", lambda r: 10)
+        g.add("a", lambda r: 1)
+        expected = ["a", "c", "b", "d"]
+        self.assertEqual(g.plan(targets={"d", "b"}), expected)
+        results = g.run(targets={"d", "b"})
+        self.assertEqual(list(results), expected)
+        self.assertEqual(list(g.execution_state()), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
