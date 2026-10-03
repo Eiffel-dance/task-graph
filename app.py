@@ -125,6 +125,48 @@ class TaskGraph:
             raise KeyError("unknown target task %r" % unknown[0])
         return selected
 
+    def _resolve_run_order(self, targets):
+        # Shared by run() and plan(): validate targets (when given), then
+        # validate the complete graph and derive the stable topological
+        # sequence this invocation covers. Returns a brand-new list on
+        # every call and never touches task functions or self._state.
+        selected = None
+        if targets is not None:
+            selected = self._normalize_targets(targets)
+        # Always validate the complete graph, including unselected nodes:
+        # a bad node outside the requested closure must not be silently
+        # accepted. order() also supplies the stable topological order whose
+        # projection determines the covered sequence.
+        order = self.order()
+        if selected is None:
+            return order
+        # Close the selected targets over their transitive dependencies,
+        # then project the full stable topological order onto that closure.
+        closure = set()
+        stack = list(selected)
+        while stack:
+            name = stack.pop()
+            if name not in closure:
+                closure.add(name)
+                stack.extend(self.deps[name])
+        return [name for name in order if name in closure]
+
+    def plan(self, targets=None):
+        """Read-only preview of the stable task sequence run() would cover.
+
+        targets=None (the default) covers the whole graph; an iterable of
+        task names is deduplicated and closed over transitive dependencies,
+        and the result is the projection of the full stable topological
+        order onto that closure. Validation mirrors run(): bad targets
+        raise TypeError/ValueError/KeyError, and missing dependencies or
+        cycles anywhere in the graph raise KeyError/ValueError — all before
+        any ordering result is produced. No task function is called, no
+        execution_state snapshot is created or replaced, and the graph is
+        never mutated. Each successful call returns a new list, so callers
+        may freely mutate the result.
+        """
+        return self._resolve_run_order(targets)
+
     def run(self, max_retries=0, continue_on_error=False, *, targets=None,
             max_concurrency=1):
         # max_retries is the number of extra attempts granted to each task
@@ -156,29 +198,11 @@ class TaskGraph:
         # historical arguments never changes. None (the default) selects the
         # whole graph; anything else must pass full input validation here,
         # before ordering and before replacing the previous snapshot.
-        selected = None
-        if targets is not None:
-            selected = self._normalize_targets(targets)
-        # Always validate the complete graph, including unselected nodes:
-        # a bad node outside the requested closure must not be silently
-        # accepted. order() also supplies the stable topological order whose
-        # projection determines actual execution order.
-        order = self.order()
-        if selected is None:
-            run_order = order
-        else:
-            # Close the selected targets over their transitive dependencies,
-            # then project the full stable topological order onto that
-            # closure; every direct dependency of a closure node is itself
-            # in the closure, so inputs are identical to a whole-graph run.
-            closure = set()
-            stack = list(selected)
-            while stack:
-                name = stack.pop()
-                if name not in closure:
-                    closure.add(name)
-                    stack.extend(self.deps[name])
-            run_order = [name for name in order if name in closure]
+        # _resolve_run_order validates targets, validates the complete
+        # graph (including unselected nodes) and returns the stable
+        # topological sequence this run covers — the exact sequence plan()
+        # would preview for the same graph and targets.
+        run_order = self._resolve_run_order(targets)
         # Fresh snapshot per run covering exactly the executed closure:
         # no records leak from previous runs or from unselected nodes.
         state = {

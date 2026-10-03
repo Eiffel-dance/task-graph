@@ -983,6 +983,168 @@ class TargetSelectionTest(unittest.TestCase):
         )
 
 
+class PlanTest(unittest.TestCase):
+    def _diamond(self):
+        # order(): a, c, b, d, e (Kahn with the smallest ready name).
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", lambda r: calls.append("b") or r["a"] + 1, ["a"])
+        g.add("c", lambda r: calls.append("c") or 10)
+        g.add("d", lambda r: calls.append("d") or r["b"] + r["c"], ["b", "c"])
+        g.add("e", lambda r: calls.append("e") or r["d"] + 1, ["d"])
+        return g, calls
+
+    def test_omitted_or_none_targets_covers_whole_graph(self):
+        g, calls = self._diamond()
+        self.assertEqual(g.plan(), ["a", "c", "b", "d", "e"])
+        self.assertEqual(g.plan(None), ["a", "c", "b", "d", "e"])
+        self.assertEqual(g.plan(targets=None), ["a", "c", "b", "d", "e"])
+        self.assertEqual(calls, [])  # previewing never calls task functions
+
+    def test_closure_is_stable_topological_projection(self):
+        g, calls = self._diamond()
+        self.assertEqual(g.plan(["d"]), ["a", "c", "b", "d"])
+        self.assertEqual(g.plan(["e", "b"]), ["a", "c", "b", "d", "e"])
+        self.assertEqual(calls, [])
+
+    def test_duplicate_targets_collapse(self):
+        g, _ = self._diamond()
+        self.assertEqual(g.plan(["b", "b", "b"]), ["a", "b"])
+
+    def test_target_without_dependencies_returns_itself(self):
+        g, _ = self._diamond()
+        self.assertEqual(g.plan(["c"]), ["c"])
+
+    def test_any_iterable_including_generators_is_accepted(self):
+        g, _ = self._diamond()
+        self.assertEqual(g.plan(t for t in ["b"]), ["a", "b"])
+        self.assertEqual(g.plan({"d"}), ["a", "c", "b", "d"])
+
+    def test_each_call_returns_a_fresh_list(self):
+        g, _ = self._diamond()
+        first = g.plan(["d"])
+        first.append("tampered")
+        first[0] = "tampered"
+        self.assertEqual(g.plan(["d"]), ["a", "c", "b", "d"])
+        self.assertIsNot(g.plan(), g.plan())
+
+    def test_plan_does_not_mutate_graph_or_state(self):
+        g, _ = self._diamond()
+        g.run(targets=["b"])
+        before_state = g.execution_state()
+        before_tasks = dict(g.tasks)
+        before_deps = {k: set(v) for k, v in g.deps.items()}
+        g.plan(["e"])
+        g.plan()
+        self.assertEqual(g.execution_state(), before_state)
+        self.assertEqual(g.tasks, before_tasks)
+        self.assertEqual(g.deps, before_deps)
+
+    def test_plan_on_fresh_graph_leaves_state_empty(self):
+        g, _ = self._diamond()
+        g.plan()
+        self.assertEqual(g.execution_state(), {})
+
+    def test_non_iterable_targets_raises_typeerror(self):
+        for bad in ("b", b"b", 1, 1.5, 0, object()):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.plan(bad)
+            self.assertIn("targets", str(ctx.exception))
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_non_string_target_name_raises_typeerror(self):
+        for bad in (["b", 1], (None,), [b"x"], [[]]):
+            g, calls = self._diamond()
+            with self.assertRaises(TypeError):
+                g.plan(bad)
+            self.assertEqual(calls, [])
+            self.assertEqual(g.execution_state(), {})
+
+    def test_empty_target_name_raises_valueerror(self):
+        for bad in ([""], ["b", ""]):
+            g, _ = self._diamond()
+            with self.assertRaises(ValueError):
+                g.plan(bad)
+
+    def test_empty_target_collection_raises_valueerror(self):
+        for bad in ([], set(), ()):
+            g, _ = self._diamond()
+            with self.assertRaises(ValueError):
+                g.plan(bad)
+
+    def test_unknown_target_raises_keyerror(self):
+        for bad in (["ghost"], ["b", "ghost"]):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(KeyError):
+                g.plan(bad)
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_missing_dependency_outside_closure_still_rejected(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: 2, ["a"])
+        g.add("z", lambda r: None, ["missing"])
+        with self.assertRaises(KeyError):
+            g.plan(["b"])
+        self.assertEqual(g.execution_state(), {})
+
+    def test_cycle_outside_closure_still_rejected(self):
+        g = TaskGraph()
+        g.add("a", lambda r: None, ["b"])
+        g.add("b", lambda r: None, ["a"])
+        g.add("ok", lambda r: 1)
+        with self.assertRaises(ValueError) as ctx:
+            g.plan(["ok"])
+        self.assertIn("cycle detected", str(ctx.exception))
+        self.assertEqual(g.execution_state(), {})
+
+    def test_failed_plan_preserves_previous_snapshot(self):
+        g, _ = self._diamond()
+        g.run(targets=["b"])
+        before = g.execution_state()
+        g.add("late", lambda r: None, ["ghost"])
+        with self.assertRaises(KeyError):
+            g.plan(["e"])
+        self.assertEqual(g.execution_state(), before)
+
+    def test_plan_matches_run_sequence_results_and_state_order(self):
+        for kwargs in (
+            {},
+            {"targets": None},
+            {"targets": ["d"]},
+            {"targets": ["e", "b"]},
+            {"targets": ["c"]},
+            {"max_retries": 2, "targets": ["d"]},
+            {"continue_on_error": True, "targets": ["e"]},
+            {"max_concurrency": 3, "targets": ["d"]},
+        ):
+            g, _ = self._diamond()
+            planned = g.plan(kwargs.get("targets"))
+            results = g.run(**kwargs)
+            self.assertEqual(list(results), planned)
+            self.assertEqual(list(g.execution_state()), planned)
+
+    def test_plan_is_deterministic_regardless_of_registration_order(self):
+        g1 = TaskGraph()
+        g1.add("b", lambda r: r["a"] + 1, ["a"])
+        g1.add("a", lambda r: 1)
+        g1.add("c", lambda r: 10)
+        g2 = TaskGraph()
+        g2.add("c", lambda r: 10)
+        g2.add("a", lambda r: 1)
+        g2.add("b", lambda r: r["a"] + 1, ["a"])
+        self.assertEqual(g1.plan(), g2.plan())
+        self.assertEqual(g1.plan(), ["a", "c", "b"])
+
+
 class ConcurrencyTest(unittest.TestCase):
     def test_invalid_max_concurrency_type_rejected_before_execution(self):
         for bad in (True, False, 1.5, "2", None, [2]):
