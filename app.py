@@ -1,4 +1,5 @@
 from collections import defaultdict, deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 
 class TaskExecutionError(Exception):
@@ -124,7 +125,8 @@ class TaskGraph:
             raise KeyError("unknown target task %r" % unknown[0])
         return selected
 
-    def run(self, max_retries=0, continue_on_error=False, *, targets=None):
+    def run(self, max_retries=0, continue_on_error=False, *, targets=None,
+            max_concurrency=1):
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -138,6 +140,17 @@ class TaskGraph:
         # previous run's snapshot is left untouched.
         if not isinstance(continue_on_error, bool):
             raise TypeError("continue_on_error must be a boolean")
+        # max_concurrency is keyword-only; 1 (the default) keeps the exact
+        # historical sequential semantics and only a positive integer above
+        # 1 enables concurrent batches. Booleans are rejected even though
+        # they are ints, since True/False is never a meaningful limit, and
+        # every invalid value is rejected before ordering, execution or
+        # state replacement so a previous run's snapshot is left untouched.
+        if (isinstance(max_concurrency, bool)
+                or not isinstance(max_concurrency, int)):
+            raise TypeError("max_concurrency must be a positive integer")
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be a positive integer")
         # targets is keyword-only so the positional interpretation of the
         # historical arguments never changes. None (the default) selects the
         # whole graph; anything else must pass full input validation here,
@@ -172,6 +185,11 @@ class TaskGraph:
             for name in run_order
         }
         self._state = state
+        if max_concurrency > 1:
+            return self._run_concurrent(
+                run_order, state, max_retries, continue_on_error,
+                max_concurrency,
+            )
         results = {}
         # "dead" nodes are failures plus everything that can no longer run
         # because it (transitively) depends on one. The run still advances
@@ -223,3 +241,99 @@ class TaskGraph:
             original = failure_errors[first]
             raise TaskExecutionError(first, original) from original
         return results
+
+    def _run_concurrent(self, run_order, state, max_retries,
+                        continue_on_error, max_concurrency):
+        # Concurrent batch scheduler used only when max_concurrency > 1.
+        # Readiness still follows the stable topological order: each round
+        # starts at most max_concurrency nodes whose direct dependencies
+        # have all completed successfully, and completion timing never
+        # changes the observable ordering of state, inputs or results.
+        results = {}
+        # "dead" nodes are failures plus everything that can no longer run
+        # because it (transitively) depends on one.
+        dead = set()
+        remaining = {name: set(self.deps[name]) for name in run_order}
+        queued = list(run_order)  # not yet started, stable topological order
+        inflight = {}  # Future -> task name
+        failures = []
+        failure_errors = {}
+        # Set when continue_on_error is False and a task has failed: the
+        # in-flight batch is allowed to finish, but nothing new is started.
+        stop = False
+
+        def attempt(name):
+            # Retry budgets are per task; every attempt receives a brand-new
+            # mapping containing only its declared upstream values. Deps of
+            # a started node have already completed, and their results are
+            # never mutated afterwards, so reading them here is safe.
+            last = None
+            for _ in range(max_retries + 1):
+                inputs = {d: results[d] for d in sorted(self.deps[name])}
+                try:
+                    return self.tasks[name](inputs), None
+                except Exception as exc:
+                    last = exc
+            return None, last
+
+        with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+            while queued or inflight:
+                if not stop:
+                    slots = max_concurrency - len(inflight)
+                    started = []
+                    still = []
+                    # queued is in stable topological order, so a single
+                    # pass also propagates deadness transitively: a node
+                    # always appears after every node it depends on.
+                    for name in queued:
+                        if self.deps[name] & dead:
+                            # Unreachable through a failed dependency: never
+                            # called, keeps the empty pending placeholder.
+                            dead.add(name)
+                        elif remaining[name]:
+                            still.append(name)
+                        elif len(started) < slots:
+                            started.append(name)
+                        else:
+                            still.append(name)
+                    queued = still
+                    for name in started:
+                        state[name]["status"] = "running"
+                        inflight[pool.submit(attempt, name)] = name
+                if not inflight:
+                    # Nothing running and nothing startable: whatever remains
+                    # queued can never run (or scheduling has stopped).
+                    break
+                done, _ = wait(inflight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    name = inflight.pop(future)
+                    value, exc = future.result()
+                    if exc is None:
+                        state[name]["status"] = "completed"
+                        state[name]["result"] = value
+                        results[name] = value
+                        for other in queued:
+                            remaining[other].discard(name)
+                    else:
+                        state[name]["status"] = "failed"
+                        state[name]["error"] = {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                        dead.add(name)
+                        failures.append(name)
+                        failure_errors[name] = exc
+                        if not continue_on_error:
+                            stop = True
+        if failures:
+            # Completion order is timing-dependent, so the reported failure
+            # is selected by stable topological order, not by finishing
+            # time; original and __cause__ are that node's final-attempt
+            # exception.
+            position = {name: i for i, name in enumerate(run_order)}
+            first = min(failures, key=position.__getitem__)
+            original = failure_errors[first]
+            raise TaskExecutionError(first, original) from original
+        # Key order follows the stable topological order of the run, never
+        # the order in which concurrent tasks happened to finish.
+        return {name: results[name] for name in run_order if name in results}
