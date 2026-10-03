@@ -21,3 +21,11 @@ Tests: python3 -m unittest discover -s tests -v
 
 `continue_on_error` 只接受布尔值：传入其他类型在任何任务执行或状态替换前抛出 `TypeError`，并保留上一份 `execution_state()` 快照。
 
+## Target selection
+
+`run(targets=[...])` 增加一个仅限关键字传入的可迭代任务名集合（省略或传 `None` 时完全保持全图行为，位置参数解释不变）。执行范围为每个目标及其全部传递依赖，重复目标只执行一次；实际执行顺序是完整图稳定拓扑序在该闭包上的投影，范围之外的任务不会被调用，闭包内任务收到的直接依赖输入映射与全图运行完全一致，返回映射包含闭包内所有成功完成的任务且键按该投影顺序排列。
+
+`targets` 的整体校验在排序、执行和替换最近一次状态快照之前完成：字符串、bytes 或其他不可迭代对象、集合中的非字符串名称抛出 `TypeError`；空名称或空集合抛出 `ValueError`；引用不存在的任务抛出 `KeyError`。这些输入错误均不执行任何任务并保留上一份 `execution_state()` 快照。目标模式下仍先对**整张图**完成既有的缺失依赖（`KeyError`）与环（`ValueError`）校验，未选中的坏节点不会被静默当作有效图。
+
+失败处理沿用既有规则：`max_retries` 按任务独立计算，`continue_on_error` 下只推进不依赖失败节点的已选任务，失败节点的下游保持 `pending`，最终仍报告稳定拓扑序中最早的 `TaskExecutionError`。一次目标运行结束后 `execution_state()` 只记录本次闭包内的节点（记录字段与快照独立性不变），闭包外节点既不执行也不出现在快照中；`targets` 省略或为 `None` 时仍记录整张图。
+

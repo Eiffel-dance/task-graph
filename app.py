@@ -97,7 +97,34 @@ class TaskGraph:
             snapshot[name] = entry
         return snapshot
 
-    def run(self, max_retries=0, continue_on_error=False):
+    def _normalize_targets(self, targets):
+        # Validate a targets argument completely before ordering, execution
+        # or state replacement. The input boundary mirrors add()'s depends:
+        # strings/bytes and other non-iterables are never a collection of
+        # task names, and repeated names collapse to a single entry.
+        if isinstance(targets, (str, bytes)):
+            raise TypeError("targets must be an iterable of task names")
+        try:
+            target_names = list(targets)
+        except TypeError:
+            raise TypeError(
+                "targets must be an iterable of task names"
+            ) from None
+        for name in target_names:
+            if not isinstance(name, str):
+                raise TypeError("target name must be a string")
+            if not name:
+                raise ValueError("target name must not be empty")
+        if not target_names:
+            raise ValueError("targets must not be empty")
+        selected = set(target_names)
+        # Report an unknown target deterministically when several are given.
+        unknown = sorted(name for name in selected if name not in self.tasks)
+        if unknown:
+            raise KeyError("unknown target task %r" % unknown[0])
+        return selected
+
+    def run(self, max_retries=0, continue_on_error=False, *, targets=None):
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -111,13 +138,38 @@ class TaskGraph:
         # previous run's snapshot is left untouched.
         if not isinstance(continue_on_error, bool):
             raise TypeError("continue_on_error must be a boolean")
-        # Validate before touching any state: a missing dependency must
-        # neither execute tasks nor discard a previous run's snapshot.
+        # targets is keyword-only so the positional interpretation of the
+        # historical arguments never changes. None (the default) selects the
+        # whole graph; anything else must pass full input validation here,
+        # before ordering and before replacing the previous snapshot.
+        selected = None
+        if targets is not None:
+            selected = self._normalize_targets(targets)
+        # Always validate the complete graph, including unselected nodes:
+        # a bad node outside the requested closure must not be silently
+        # accepted. order() also supplies the stable topological order whose
+        # projection determines actual execution order.
         order = self.order()
-        # Fresh snapshot per run: no records leak from previous runs.
+        if selected is None:
+            run_order = order
+        else:
+            # Close the selected targets over their transitive dependencies,
+            # then project the full stable topological order onto that
+            # closure; every direct dependency of a closure node is itself
+            # in the closure, so inputs are identical to a whole-graph run.
+            closure = set()
+            stack = list(selected)
+            while stack:
+                name = stack.pop()
+                if name not in closure:
+                    closure.add(name)
+                    stack.extend(self.deps[name])
+            run_order = [name for name in order if name in closure]
+        # Fresh snapshot per run covering exactly the executed closure:
+        # no records leak from previous runs or from unselected nodes.
         state = {
             name: {"status": "pending", "result": None, "error": None}
-            for name in order
+            for name in run_order
         }
         self._state = state
         results = {}
@@ -127,7 +179,7 @@ class TaskGraph:
         dead = set()
         failures = []
         failure_errors = {}
-        for name in order:
+        for name in run_order:
             # Any direct dependency that failed or was skipped marks this
             # node as unreachable; it is never called and keeps the empty
             # pending placeholder (result/error both None).

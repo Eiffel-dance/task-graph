@@ -713,5 +713,275 @@ class ContinueOnErrorTest(unittest.TestCase):
         self.assertEqual(calls, ["a"])
 
 
+class TargetSelectionTest(unittest.TestCase):
+    def _diamond(self):
+        # order(): a, c, b, d, e (Kahn with the smallest ready name).
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", lambda r: calls.append("b") or r["a"] + 1, ["a"])
+        g.add("c", lambda r: calls.append("c") or 10)
+        g.add("d", lambda r: calls.append("d") or r["b"] + r["c"], ["b", "c"])
+        g.add("e", lambda r: calls.append("e") or r["d"] + 1, ["d"])
+        return g, calls
+
+    def test_closure_runs_in_stable_topological_projection(self):
+        g, calls = self._diamond()
+        self.assertEqual(g.order(), ["a", "c", "b", "d", "e"])
+        results = g.run(targets=["d"])
+        self.assertEqual(results, {"a": 1, "c": 10, "b": 2, "d": 12})
+        self.assertEqual(list(results), ["a", "c", "b", "d"])
+        self.assertEqual(calls, ["a", "c", "b", "d"])  # e never called
+        state = g.execution_state()
+        self.assertEqual(set(state), {"a", "b", "c", "d"})  # e absent
+        self.assertTrue(
+            all(record["status"] == "completed" for record in state.values())
+        )
+
+    def test_duplicate_targets_collapse_to_one_run(self):
+        g, calls = self._diamond()
+        results = g.run(targets=["b", "b", "b"])
+        self.assertEqual(results, {"a": 1, "b": 2})
+        self.assertEqual(calls, ["a", "b"])
+
+    def test_multiple_targets_share_their_closure(self):
+        g, calls = self._diamond()
+        results = g.run(targets=["e", "b"])
+        self.assertEqual(list(results), ["a", "c", "b", "d", "e"])
+        self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+
+    def test_any_iterable_including_generators_is_accepted(self):
+        g, calls = self._diamond()
+        self.assertEqual(
+            g.run(targets=(t for t in ["b"])), {"a": 1, "b": 2}
+        )
+        self.assertEqual(calls, ["a", "b"])
+
+    def test_target_node_without_dependencies_runs_alone(self):
+        g, calls = self._diamond()
+        self.assertEqual(g.run(targets=["c"]), {"c": 10})
+        self.assertEqual(calls, ["c"])
+        self.assertEqual(set(g.execution_state()), {"c"})
+
+    def test_omitted_or_none_targets_keeps_whole_graph_behavior(self):
+        g, calls = self._diamond()
+        self.assertEqual(
+            g.run(), {"a": 1, "c": 10, "b": 2, "d": 12, "e": 13}
+        )
+        g, calls = self._diamond()
+        self.assertEqual(
+            g.run(targets=None), {"a": 1, "c": 10, "b": 2, "d": 12, "e": 13}
+        )
+        self.assertEqual(set(g.execution_state()), {"a", "b", "c", "d", "e"})
+
+    def test_targets_is_keyword_only(self):
+        g, _ = self._diamond()
+        with self.assertRaises(TypeError):
+            g.run(0, False, ["b"])
+
+    def test_closure_inputs_match_whole_graph_inputs(self):
+        seen = {}
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("x", lambda r: 99)
+        g.add(
+            "b",
+            lambda r: (seen.update(b=r), r["a"] + 1)[1],
+            ["a"],
+        )
+        g.add("c", lambda r: r["b"] + r["x"], ["b", "x"])
+        g.run(targets=["c"])
+        self.assertEqual(seen["b"], {"a": 1})  # no extra or missing keys
+
+    def test_non_iterable_targets_raises_typeerror_without_running(self):
+        for bad in ("b", b"b", 1, 1.5, 0, object()):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(targets=bad)
+            self.assertIn("targets", str(ctx.exception))
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_non_string_target_name_raises_typeerror(self):
+        for bad in (["b", 1], (None,), [b"x"], [[]]):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(TypeError):
+                g.run(targets=bad)
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_empty_target_name_raises_valueerror(self):
+        for bad in ([""], ["b", ""]):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(ValueError):
+                g.run(targets=bad)
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_empty_target_collection_raises_valueerror(self):
+        for bad in ([], set(), ()):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(ValueError):
+                g.run(targets=bad)
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_unknown_target_raises_keyerror_without_running(self):
+        for bad in (["ghost"], ["b", "ghost"]):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(KeyError):
+                g.run(targets=bad)
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_missing_dependency_outside_selection_still_rejected(self):
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", lambda r: calls.append("b") or 2, ["a"])
+        g.add("z", lambda r: None, ["missing"])
+        with self.assertRaises(KeyError):
+            g.run(targets=["b"])
+        self.assertEqual(calls, [])
+        self.assertEqual(g.execution_state(), {})
+
+    def test_cycle_outside_selection_still_rejected(self):
+        g = TaskGraph()
+        g.add("a", lambda r: None, ["b"])
+        g.add("b", lambda r: None, ["a"])
+        g.add("ok", lambda r: 1)
+        with self.assertRaises(ValueError) as ctx:
+            g.run(targets=["ok"])
+        self.assertIn("cycle detected", str(ctx.exception))
+        self.assertEqual(g.execution_state(), {})
+
+    def test_graph_errors_do_not_replace_a_previous_target_snapshot(self):
+        g, _ = self._diamond()
+        g.run(targets=["b"])
+        before = g.execution_state()
+        self.assertEqual(set(before), {"a", "b"})
+        g.add("late", lambda r: None, ["ghost"])
+        with self.assertRaises(KeyError):
+            g.run(targets=["e"])
+        self.assertEqual(g.execution_state(), before)
+
+    def test_failure_wraps_and_snapshot_covers_only_closure(self):
+        calls = []
+
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", boom, ["a"])
+        g.add("c", lambda r: calls.append("c") or 3, ["b"])
+        g.add("free", lambda r: calls.append("free") or 9)
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(targets=["c"])
+        err = ctx.exception
+        self.assertEqual(err.task_name, "b")
+        self.assertIs(err.original, err.__cause__)
+        self.assertEqual(str(err.original), "boom")
+        self.assertEqual(calls, ["a"])  # free is unselected; c blocked
+        state = g.execution_state()
+        self.assertEqual(set(state), {"a", "b", "c"})
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "failed")
+        self.assertEqual(
+            state["b"]["error"],
+            {"type": "RuntimeError", "message": "boom"},
+        )
+        self.assertEqual(
+            state["c"], {"status": "pending", "result": None, "error": None}
+        )
+
+    def test_continue_on_error_advances_only_unblocked_selected_tasks(self):
+        def boom(r):
+            raise RuntimeError("boom b")
+
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", boom, ["a"])
+        g.add("c", lambda r: calls.append("c") or 3, ["b"])
+        g.add("d", lambda r: calls.append("d") or 4, ["b"])
+        g.add("e", lambda r: calls.append("e") or 5)
+        g.add("f", lambda r: calls.append("f") or r["e"] + 1, ["e"])
+        g.add("outside", lambda r: calls.append("outside") or 99)
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True, targets=["c", "d", "f"])
+        self.assertEqual(ctx.exception.task_name, "b")
+        # The failing b is invoked but boom records nothing; blocked
+        # downstream and unselected independent tasks never run.
+        self.assertEqual(calls, ["a", "e", "f"])
+        state = g.execution_state()
+        self.assertEqual(set(state), {"a", "b", "c", "d", "e", "f"})
+        self.assertEqual(state["c"]["status"], "pending")
+        self.assertEqual(state["d"]["status"], "pending")
+        self.assertEqual(state["f"]["result"], 6)
+        self.assertNotIn("outside", state)
+
+    def test_retries_still_apply_inside_closure(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                raise RuntimeError("once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("x", flaky)
+        g.add("y", lambda r: r["x"] + "!", ["x"])
+        self.assertEqual(
+            g.run(max_retries=1, targets=["y"]),
+            {"x": "ok", "y": "ok!"},
+        )
+        self.assertEqual(attempts["n"], 2)
+
+    def test_exhausted_retries_skip_downstream_in_closure(self):
+        attempts = []
+
+        def always(r):
+            attempts.append(1)
+            raise ValueError("nope")
+
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", always, ["a"])
+        g.add("c", lambda r: 3, ["b"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_retries=2, targets=["c"])
+        self.assertEqual(ctx.exception.task_name, "b")
+        self.assertEqual(len(attempts), 3)
+        state = g.execution_state()
+        self.assertEqual(set(state), {"a", "b", "c"})
+        self.assertEqual(state["c"]["status"], "pending")
+
+    def test_target_snapshot_is_independent_of_previous_and_next_runs(self):
+        g, _ = self._diamond()
+        g.run(targets=["b"])
+        snapshot = g.execution_state()
+        snapshot["a"]["status"] = "tampered"
+        snapshot["new"] = {}
+        self.assertEqual(g.execution_state()["a"]["status"], "completed")
+        self.assertNotIn("new", g.execution_state())
+        # A later whole-graph run records the whole graph again.
+        g.run()
+        self.assertEqual(
+            set(g.execution_state()), {"a", "b", "c", "d", "e"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
