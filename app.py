@@ -97,7 +97,7 @@ class TaskGraph:
             snapshot[name] = entry
         return snapshot
 
-    def run(self, max_retries=0):
+    def run(self, max_retries=0, continue_on_error=False):
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -106,6 +106,11 @@ class TaskGraph:
             raise ValueError("max_retries must be a non-negative integer")
         if max_retries < 0:
             raise ValueError("max_retries must be a non-negative integer")
+        # continue_on_error is opt-in and strictly boolean; anything else
+        # is rejected before ordering, execution or state replacement so a
+        # previous run's snapshot is left untouched.
+        if not isinstance(continue_on_error, bool):
+            raise TypeError("continue_on_error must be a boolean")
         # Validate before touching any state: a missing dependency must
         # neither execute tasks nor discard a previous run's snapshot.
         order = self.order()
@@ -116,7 +121,19 @@ class TaskGraph:
         }
         self._state = state
         results = {}
+        # "dead" nodes are failures plus everything that can no longer run
+        # because it (transitively) depends on one. The run still advances
+        # strictly in stable topological order.
+        dead = set()
+        failures = []
+        failure_errors = {}
         for name in order:
+            # Any direct dependency that failed or was skipped marks this
+            # node as unreachable; it is never called and keeps the empty
+            # pending placeholder (result/error both None).
+            if self.deps[name] & dead:
+                dead.add(name)
+                continue
             state[name]["status"] = "running"
             # Retry budgets are per task: every task gets its own
             # max_retries extra attempts regardless of upstream outcomes.
@@ -135,9 +152,22 @@ class TaskGraph:
                         "type": type(exc).__name__,
                         "message": str(exc),
                     }
-                    raise TaskExecutionError(name, exc) from exc
+                    if not continue_on_error:
+                        raise TaskExecutionError(name, exc) from exc
+                    # Record the failure immediately and press on with
+                    # tasks that do not depend on it.
+                    dead.add(name)
+                    failures.append(name)
+                    failure_errors[name] = exc
+                    break
+                state[name]["status"] = "completed"
+                state[name]["result"] = value
+                results[name] = value
                 break
-            state[name]["status"] = "completed"
-            state[name]["result"] = value
-            results[name] = value
+        if failures:
+            # Report the earliest failure in stable topological order; its
+            # original and __cause__ are that node's final-attempt exception.
+            first = failures[0]
+            original = failure_errors[first]
+            raise TaskExecutionError(first, original) from original
         return results

@@ -451,5 +451,267 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(g.execution_state(), {})
 
 
+class ContinueOnErrorTest(unittest.TestCase):
+    def test_independent_tasks_run_and_dependents_stay_pending(self):
+        calls = []
+
+        def boom(r):
+            calls.append("b")
+            raise RuntimeError("boom b")
+
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", boom, depends=["a"])
+        g.add("c", lambda r: calls.append("c") or 3, depends=["b"])
+        g.add("d", lambda r: calls.append("d") or 4, depends=["b"])
+        g.add("e", lambda r: calls.append("e") or 5)
+        g.add("f", lambda r: calls.append("f") or r["e"] + 1, depends=["e"])
+        self.assertEqual(g.order(), ["a", "e", "b", "f", "c", "d"])
+
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True)
+        err = ctx.exception
+        self.assertEqual(err.task_name, "b")
+        self.assertIsInstance(err.original, RuntimeError)
+        self.assertEqual(str(err.original), "boom b")
+        self.assertIs(err.__cause__, err.original)
+        # Still strictly stable topological order; blocked nodes never run.
+        self.assertEqual(calls, ["a", "e", "b", "f"])
+
+        state = g.execution_state()
+        self.assertEqual(
+            state["a"], {"status": "completed", "result": 1, "error": None}
+        )
+        self.assertEqual(state["b"]["status"], "failed")
+        self.assertIsNone(state["b"]["result"])
+        self.assertEqual(
+            state["b"]["error"],
+            {"type": "RuntimeError", "message": "boom b"},
+        )
+        self.assertEqual(
+            state["c"], {"status": "pending", "result": None, "error": None}
+        )
+        self.assertEqual(
+            state["d"], {"status": "pending", "result": None, "error": None}
+        )
+        self.assertEqual(
+            state["e"], {"status": "completed", "result": 5, "error": None}
+        )
+        self.assertEqual(state["f"]["status"], "completed")
+        self.assertEqual(state["f"]["result"], 6)
+
+    def test_transitive_dependents_are_never_called(self):
+        calls = []
+
+        def fail(r):
+            raise ValueError("up")
+
+        g = TaskGraph()
+        g.add("a", fail)
+        g.add("b", lambda r: calls.append("b"), depends=["a"])
+        g.add("c", lambda r: calls.append("c"), depends=["b"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True)
+        self.assertEqual(ctx.exception.task_name, "a")
+        self.assertEqual(calls, [])
+        self.assertEqual(g.execution_state()["c"]["status"], "pending")
+
+    def test_earliest_failure_in_topological_order_is_reported(self):
+        def fail(letter):
+            def task(r):
+                raise ValueError("err " + letter)
+            return task
+
+        g = TaskGraph()
+        g.add("a", fail("a"))
+        g.add("b", fail("b"))
+        g.add("c", lambda r: "ok")
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True)
+        self.assertEqual(ctx.exception.task_name, "a")
+        self.assertEqual(str(ctx.exception.original), "err a")
+        self.assertIs(ctx.exception.__cause__, ctx.exception.original)
+
+    def test_diamond_join_blocked_when_one_branch_fails(self):
+        calls = []
+
+        def fail(r):
+            raise RuntimeError("bad branch")
+
+        g = TaskGraph()
+        g.add("bad", fail)
+        g.add("good", lambda r: calls.append("good") or 2)
+        g.add("join", lambda r: calls.append("join"), depends=["bad", "good"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(continue_on_error=True)
+        self.assertNotIn("join", calls)
+        self.assertEqual(g.execution_state()["join"]["status"], "pending")
+
+    def test_no_failure_returns_results_in_stable_order(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: 2)
+        g.add("c", lambda r: r["a"] + r["b"], depends=["a", "b"])
+        results = g.run(continue_on_error=True)
+        self.assertEqual(results, {"a": 1, "b": 2, "c": 3})
+        self.assertEqual(list(results), ["a", "b", "c"])
+        self.assertTrue(
+            all(
+                record["status"] == "completed"
+                for record in g.execution_state().values()
+            )
+        )
+
+    def test_retry_budget_still_per_task_and_last_exception_reported(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            raise RuntimeError("fail %d" % attempts["n"])
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        g.add("ind", lambda r: "independent")
+        g.add("down", lambda r: None, depends=["flaky"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_retries=2, continue_on_error=True)
+        self.assertEqual(ctx.exception.task_name, "flaky")
+        self.assertEqual(str(ctx.exception.original), "fail 3")
+        self.assertEqual(attempts["n"], 3)
+        state = g.execution_state()
+        self.assertEqual(
+            state["flaky"]["error"],
+            {"type": "RuntimeError", "message": "fail 3"},
+        )
+        self.assertEqual(state["ind"]["status"], "completed")
+        self.assertEqual(
+            state["down"], {"status": "pending", "result": None, "error": None}
+        )
+
+    def test_retry_recovery_avoids_failure(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        g.add("down", lambda r: r["flaky"] + "!", depends=["flaky"])
+        self.assertEqual(
+            g.run(max_retries=1, continue_on_error=True),
+            {"flaky": "ok", "down": "ok!"},
+        )
+
+    def test_each_attempt_still_gets_fresh_input_mapping(self):
+        raw = []
+        seen = []
+
+        def flaky(r):
+            raw.append(r)
+            seen.append(dict(r))
+            r["polluted"] = True
+            raise RuntimeError("always")
+
+        g = TaskGraph()
+        g.add("dep", lambda r: 1)
+        g.add("flaky", flaky, depends=["dep"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(max_retries=1, continue_on_error=True)
+        self.assertIsNot(raw[0], raw[1])
+        self.assertEqual(seen, [{"dep": 1}, {"dep": 1}])
+
+    def test_invalid_flag_type_rejected_before_execution(self):
+        for bad in (0, 1, "true", None, 1.0, ["x"], ()):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(continue_on_error=bad)
+            self.assertIn("continue_on_error", str(ctx.exception))
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_invalid_flag_type_with_empty_graph_keeps_state_empty(self):
+        g = TaskGraph()
+        with self.assertRaises(TypeError):
+            g.run(continue_on_error=1)
+        self.assertEqual(g.execution_state(), {})
+
+    def test_invalid_max_retries_still_rejected_with_flag_on(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7)
+        g.run()
+        before = g.execution_state()
+        for bad in (-1, True, False, 1.5, "2", None):
+            with self.assertRaises(ValueError):
+                g.run(max_retries=bad, continue_on_error=True)
+        self.assertEqual(g.execution_state(), before)
+
+    def test_graph_validation_errors_unchanged_with_flag_on(self):
+        ran = []
+        g = TaskGraph()
+        g.add("ok", lambda r: ran.append(1) or 1)
+        g.run()
+        before = g.execution_state()
+        g.add("late", lambda r: ran.append(2), depends=["ghost"])
+        with self.assertRaises(KeyError):
+            g.run(continue_on_error=True)
+        self.assertEqual(ran, [1])
+        self.assertEqual(g.execution_state(), before)
+
+        g2 = TaskGraph()
+        g2.add("a", lambda r: None, depends=["b"])
+        g2.add("b", lambda r: None, depends=["a"])
+        with self.assertRaises(ValueError) as ctx:
+            g2.run(continue_on_error=True)
+        self.assertIn("cycle detected", str(ctx.exception))
+
+    def test_snapshot_independence_for_failed_and_skipped_nodes(self):
+        def fail(r):
+            raise ValueError("v")
+
+        g = TaskGraph()
+        g.add("f", fail)
+        g.add("d", lambda r: None, depends=["f"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(continue_on_error=True)
+        snapshot = g.execution_state()
+        snapshot["f"]["error"]["message"] = "tampered"
+        snapshot["d"]["status"] = "completed"
+        again = g.execution_state()
+        self.assertEqual(again["f"]["error"]["message"], "v")
+        self.assertEqual(again["d"]["status"], "pending")
+
+    def test_default_off_stops_at_first_failure(self):
+        calls = []
+
+        def fail(r):
+            raise RuntimeError("stop")
+
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a"))
+        g.add("b", fail)
+        g.add("c", lambda r: calls.append("c"))
+        for kwargs in ({}, {"continue_on_error": False}):
+            local = []
+            g2 = TaskGraph()
+            g2.add("a", lambda r: local.append("a"))
+            g2.add("b", fail)
+            g2.add("c", lambda r: local.append("c"))
+            with self.assertRaises(TaskExecutionError) as ctx:
+                g2.run(**kwargs)
+            self.assertEqual(ctx.exception.task_name, "b")
+            self.assertEqual(local, ["a"])
+        # sanity: the first graph itself behaves identically
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        self.assertEqual(calls, ["a"])
+
+
 if __name__ == "__main__":
     unittest.main()
