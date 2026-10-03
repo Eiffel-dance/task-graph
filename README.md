@@ -29,3 +29,11 @@ Tests: python3 -m unittest discover -s tests -v
 
 失败处理沿用既有规则：`max_retries` 按任务独立计算，`continue_on_error` 下只推进不依赖失败节点的已选任务，失败节点的下游保持 `pending`，最终仍报告稳定拓扑序中最早的 `TaskExecutionError`。一次目标运行结束后 `execution_state()` 只记录本次闭包内的节点（记录字段与快照独立性不变），闭包外节点既不执行也不出现在快照中；`targets` 省略或为 `None` 时仍记录整张图。
 
+## Concurrency
+
+`run(max_concurrency=k)` 增加一个仅限关键字传入的并发上限（默认 `1`，此时任务调用次序、返回结果与 `execution_state()` 与既有顺序执行完全一致）。`k` 必须是正整数：布尔值或其他非整数类型抛出 `TypeError`，不大于零的整数抛出 `ValueError`；校验在任何任务执行、排序和状态快照替换之前完成，失败时保留上一份 `execution_state()` 快照。
+
+`k > 1` 时启用分批并发调度：仍先对整张图完成既有的缺失依赖（`KeyError`）与环（`ValueError`）校验，然后按稳定拓扑序确定就绪节点（全部直接依赖已成功完成），每轮最多启动 `k` 个任务并等待本批次全部收束后才进入下一轮。任务函数仍只收到由直接依赖结果组成的全新输入映射，重试预算仍按任务独立计算；输入映射的键序、返回映射的键序以及 `execution_state()` 的记录顺序始终按稳定拓扑序确定，任务完成的先后不改变任何可观察顺序。
+
+失败语义与顺序执行一致：`continue_on_error=False`（默认）时，若批次中有任务耗尽重试仍失败，调度器等待本批次已启动的任务收束后停止启动新节点，抛出稳定拓扑序中最早失败节点的 `TaskExecutionError`（`task_name`、`original`、`__cause__` 指向该节点最后一次尝试的原始异常）；失败节点记录 `failed` 及最后异常的 `type` 与 `message`，已完成节点保留结果，未启动及依赖失败的节点保持 `pending`。`continue_on_error=True` 时，独立可运行节点继续推进，直接或间接依赖失败节点的任务不被调用，全部可调度工作结束后仍报告稳定拓扑序中最早的失败；无失败时返回完整（或 `targets` 闭包内）的结果。
+

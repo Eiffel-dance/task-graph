@@ -983,5 +983,268 @@ class TargetSelectionTest(unittest.TestCase):
         )
 
 
+class ConcurrencyTest(unittest.TestCase):
+    def test_invalid_max_concurrency_type_rejected_before_execution(self):
+        for bad in (True, False, 1.5, "2", None, [2]):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(max_concurrency=bad)
+            self.assertIn("max_concurrency", str(ctx.exception))
+            self.assertEqual(calls, [1])  # nothing executed on the bad call
+            self.assertEqual(g.execution_state(), before)
+
+    def test_invalid_max_concurrency_value_rejected_before_execution(self):
+        for bad in (0, -1, -100):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(ValueError) as ctx:
+                g.run(max_concurrency=bad)
+            self.assertIn("max_concurrency", str(ctx.exception))
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_invalid_max_concurrency_with_empty_graph(self):
+        g = TaskGraph()
+        with self.assertRaises(TypeError):
+            g.run(max_concurrency=True)
+        with self.assertRaises(ValueError):
+            g.run(max_concurrency=0)
+        self.assertEqual(g.execution_state(), {})
+
+    def test_max_concurrency_is_keyword_only(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        with self.assertRaises(TypeError):
+            g.run(0, False, None, 2)
+
+    def test_default_and_one_keep_sequential_order(self):
+        for kwargs in ({}, {"max_concurrency": 1}):
+            calls = []
+            g = TaskGraph()
+            g.add("a", lambda r: calls.append("a") or 1)
+            g.add("b", lambda r: calls.append("b") or 2)
+            g.add("c", lambda r: calls.append("c") or r["a"] + r["b"],
+                  depends=["a", "b"])
+            self.assertEqual(g.run(**kwargs), {"a": 1, "b": 2, "c": 3})
+            self.assertEqual(calls, ["a", "b", "c"])
+
+    def test_concurrency_limit_is_respected_and_reached(self):
+        import threading
+        import time
+
+        lock = threading.Lock()
+        current = {"n": 0}
+        peak = {"n": 0}
+
+        def task(r):
+            with lock:
+                current["n"] += 1
+                peak["n"] = max(peak["n"], current["n"])
+            time.sleep(0.05)
+            with lock:
+                current["n"] -= 1
+            return 1
+
+        g = TaskGraph()
+        for name in ("a", "b", "c", "d"):
+            g.add(name, task)
+        results = g.run(max_concurrency=2)
+        self.assertEqual(results, {"a": 1, "b": 1, "c": 1, "d": 1})
+        self.assertEqual(peak["n"], 2)  # limited to, and actually reaching, 2
+
+    def test_results_order_follows_topology_not_completion(self):
+        import time
+
+        def slow(r):
+            time.sleep(0.1)
+            return "slow"
+
+        g = TaskGraph()
+        g.add("a", slow)
+        g.add("b", lambda r: "fast")
+        g.add("c", lambda r: r["a"] + r["b"], depends=["a", "b"])
+        results = g.run(max_concurrency=2)
+        # b finishes long before a, but the key order stays topological.
+        self.assertEqual(list(results), ["a", "b", "c"])
+        self.assertEqual(results, {"a": "slow", "b": "fast", "c": "slowfast"})
+        self.assertEqual(list(g.execution_state()), ["a", "b", "c"])
+
+    def test_downstream_waits_for_all_direct_dependencies(self):
+        import threading
+        import time
+
+        done = set()
+        lock = threading.Lock()
+
+        def make(name, delay):
+            def task(r):
+                time.sleep(delay)
+                with lock:
+                    done.add(name)
+                return name
+            return task
+
+        seen = {}
+
+        def join(r):
+            seen["deps_done"] = set(done)
+            return "join"
+
+        g = TaskGraph()
+        g.add("slow", make("slow", 0.15))
+        g.add("fast", make("fast", 0.01))
+        g.add("join", join, depends=["slow", "fast"])
+        self.assertEqual(
+            g.run(max_concurrency=2),
+            {"slow": "slow", "fast": "fast", "join": "join"},
+        )
+        self.assertEqual(seen["deps_done"], {"slow", "fast"})
+
+    def test_failure_waits_for_batch_then_stops_scheduling(self):
+        import time
+
+        calls = []
+
+        def boom(r):
+            raise RuntimeError("batch boom")
+
+        def slow(r):
+            time.sleep(0.1)
+            calls.append("slow")
+            return "slow"
+
+        g = TaskGraph()
+        g.add("boom", boom)
+        g.add("slow", slow)
+        g.add("later", lambda r: calls.append("later") or 1,
+              depends=["slow"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_concurrency=2)
+        err = ctx.exception
+        self.assertEqual(err.task_name, "boom")
+        self.assertIs(err.__cause__, err.original)
+        self.assertIsInstance(err.original, RuntimeError)
+        # The already-started batch settled; nothing new was scheduled.
+        self.assertEqual(calls, ["slow"])
+        state = g.execution_state()
+        self.assertEqual(state["boom"]["status"], "failed")
+        self.assertEqual(
+            state["boom"]["error"],
+            {"type": "RuntimeError", "message": "batch boom"},
+        )
+        self.assertEqual(
+            state["slow"],
+            {"status": "completed", "result": "slow", "error": None},
+        )
+        self.assertEqual(state["later"]["status"], "pending")
+
+    def test_earliest_failure_in_batch_is_reported(self):
+        g = TaskGraph()
+        g.add("a", lambda r: (_ for _ in ()).throw(ValueError("err a")))
+        g.add("b", lambda r: (_ for _ in ()).throw(RuntimeError("err b")))
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_concurrency=2)
+        self.assertEqual(ctx.exception.task_name, "a")
+        self.assertEqual(str(ctx.exception.original), "err a")
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "failed")
+        self.assertEqual(state["b"]["status"], "failed")
+
+    def test_continue_on_error_advances_independent_branches(self):
+        import time
+
+        calls = []
+
+        def boom(r):
+            raise RuntimeError("boom b")
+
+        def slow(r):
+            time.sleep(0.1)
+            calls.append("slow")
+            return "slow"
+
+        g = TaskGraph()
+        g.add("boom", boom)
+        g.add("slow", slow)
+        g.add("down", lambda r: calls.append("down"), depends=["boom"])
+        g.add("join", lambda r: calls.append("join"),
+              depends=["slow", "boom"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_concurrency=2, continue_on_error=True)
+        self.assertEqual(ctx.exception.task_name, "boom")
+        self.assertIs(ctx.exception.__cause__, ctx.exception.original)
+        self.assertEqual(calls, ["slow"])  # blocked nodes never called
+        state = g.execution_state()
+        self.assertEqual(state["boom"]["status"], "failed")
+        self.assertEqual(state["slow"]["status"], "completed")
+        self.assertEqual(state["down"]["status"], "pending")
+        self.assertEqual(state["join"]["status"], "pending")
+
+    def test_retries_and_fresh_inputs_with_concurrency(self):
+        raw = []
+        seen = []
+        attempts = {"n": 0}
+
+        def flaky(r):
+            raw.append(r)
+            seen.append(dict(r))
+            r["polluted"] = True
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("dep", lambda r: 1)
+        g.add("other", lambda r: 2)
+        g.add("flaky", flaky, depends=["dep"])
+        g.add("down", lambda r: r["flaky"] + "!", depends=["flaky"])
+        self.assertEqual(
+            g.run(max_retries=1, max_concurrency=2),
+            {"dep": 1, "other": 2, "flaky": "ok", "down": "ok!"},
+        )
+        self.assertEqual(attempts["n"], 2)
+        self.assertIsNot(raw[0], raw[1])
+        self.assertEqual(seen, [{"dep": 1}, {"dep": 1}])
+
+    def test_targets_closure_with_concurrency(self):
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", lambda r: calls.append("b") or r["a"] + 1, ["a"])
+        g.add("c", lambda r: calls.append("c") or 10)
+        g.add("d", lambda r: calls.append("d") or r["b"] + r["c"], ["b", "c"])
+        g.add("e", lambda r: calls.append("e") or r["d"] + 1, ["d"])
+        results = g.run(targets=["d"], max_concurrency=2)
+        self.assertEqual(results, {"a": 1, "c": 10, "b": 2, "d": 12})
+        self.assertEqual(list(results), ["a", "c", "b", "d"])
+        self.assertEqual(sorted(calls), ["a", "b", "c", "d"])  # e never ran
+        self.assertEqual(set(g.execution_state()), {"a", "b", "c", "d"})
+
+    def test_graph_validation_unchanged_with_concurrency(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 1)
+        g.run()
+        before = g.execution_state()
+        g.add("late", lambda r: None, depends=["ghost"])
+        with self.assertRaises(KeyError):
+            g.run(max_concurrency=2)
+        self.assertEqual(g.execution_state(), before)
+
+        g2 = TaskGraph()
+        g2.add("a", lambda r: None, depends=["b"])
+        g2.add("b", lambda r: None, depends=["a"])
+        with self.assertRaises(ValueError) as ctx:
+            g2.run(max_concurrency=2)
+        self.assertIn("cycle detected", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
