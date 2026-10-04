@@ -1,4 +1,5 @@
 from collections import defaultdict, deque
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -151,6 +152,34 @@ class TaskGraph:
                 stack.extend(self.deps[name])
         return [name for name in order if name in closure]
 
+    def _normalize_retry_limits(self, retry_limits):
+        # Validate a retry_limits mapping completely before ordering,
+        # execution or state replacement. Each entry overrides max_retries
+        # for one task; tasks without an entry keep the max_retries
+        # default. Booleans are rejected even though they are ints, since
+        # True/False is never a meaningful retry count.
+        if not isinstance(retry_limits, Mapping):
+            raise TypeError(
+                "retry_limits must be a mapping of task names to "
+                "non-negative integers"
+            )
+        limits = {}
+        for name, limit in retry_limits.items():
+            if not isinstance(name, str):
+                raise TypeError("retry_limits task name must be a string")
+            if isinstance(limit, bool) or not isinstance(limit, int):
+                raise TypeError("retry limit must be a non-negative integer")
+            if limit < 0:
+                raise ValueError(
+                    "retry limit must be a non-negative integer"
+                )
+            limits[name] = limit
+        # Report an unknown task deterministically when several are given.
+        unknown = sorted(name for name in limits if name not in self.tasks)
+        if unknown:
+            raise KeyError("unknown task %r in retry_limits" % unknown[0])
+        return limits
+
     def plan(self, targets=None):
         """Read-only preview of the stable task sequence run() would cover.
 
@@ -168,7 +197,7 @@ class TaskGraph:
         return self._resolve_run_order(targets)
 
     def run(self, max_retries=0, continue_on_error=False, *, targets=None,
-            max_concurrency=1):
+            max_concurrency=1, retry_limits=None):
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -194,6 +223,17 @@ class TaskGraph:
             raise TypeError("max_concurrency must be a positive integer")
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be a positive integer")
+        # retry_limits is keyword-only, so the positional interpretation of
+        # the historical arguments never changes. None (the default) gives
+        # every task the uniform max_retries budget; a mapping overrides the
+        # budget per named task. Full validation happens here, before
+        # ordering, execution and replacement of the previous snapshot, so
+        # a rejected mapping leaves the graph and the last execution_state
+        # untouched. Entries for tasks outside the targets closure are
+        # legal and simply never take effect.
+        limits = {}
+        if retry_limits is not None:
+            limits = self._normalize_retry_limits(retry_limits)
         # targets is keyword-only so the positional interpretation of the
         # historical arguments never changes. None (the default) selects the
         # whole graph; anything else must pass full input validation here,
@@ -213,7 +253,7 @@ class TaskGraph:
         if max_concurrency > 1:
             return self._run_concurrent(
                 run_order, state, max_retries, continue_on_error,
-                max_concurrency,
+                max_concurrency, limits,
             )
         results = {}
         # "dead" nodes are failures plus everything that can no longer run
@@ -230,9 +270,11 @@ class TaskGraph:
                 dead.add(name)
                 continue
             state[name]["status"] = "running"
-            # Retry budgets are per task: every task gets its own
-            # max_retries extra attempts regardless of upstream outcomes.
-            for attempt in range(max_retries + 1):
+            # Retry budgets are per task: a retry_limits entry overrides
+            # max_retries for this task alone, and each task's budget is
+            # independent of every other task's attempts.
+            budget = limits.get(name, max_retries)
+            for attempt in range(budget + 1):
                 # Each attempt receives a brand-new mapping containing only
                 # its declared upstream values; ordering keys keeps calls
                 # reproducible.
@@ -240,7 +282,7 @@ class TaskGraph:
                 try:
                     value = self.tasks[name](inputs)
                 except Exception as exc:
-                    if attempt < max_retries:
+                    if attempt < budget:
                         continue  # retry the same task immediately
                     state[name]["status"] = "failed"
                     state[name]["error"] = {
@@ -268,7 +310,7 @@ class TaskGraph:
         return results
 
     def _run_concurrent(self, run_order, state, max_retries,
-                        continue_on_error, max_concurrency):
+                        continue_on_error, max_concurrency, retry_limits):
         """Batch scheduler used when max_concurrency > 1.
 
         Each round starts at most max_concurrency ready tasks — those whose
@@ -288,12 +330,13 @@ class TaskGraph:
         pending = list(run_order)
 
         def attempt(name):
-            # Retry budgets are per task, and every attempt receives a
-            # brand-new mapping of its direct dependencies, exactly as in
+            # Retry budgets are per task — a retry_limits entry overrides
+            # max_retries for this task alone — and every attempt receives
+            # a brand-new mapping of its direct dependencies, exactly as in
             # the sequential scheduler. results is only written by the
             # scheduler thread between batches, so reads here are safe.
             last = None
-            for _ in range(max_retries + 1):
+            for _ in range(retry_limits.get(name, max_retries) + 1):
                 inputs = {d: results[d] for d in sorted(self.deps[name])}
                 try:
                     return True, self.tasks[name](inputs), None

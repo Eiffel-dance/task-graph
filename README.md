@@ -13,6 +13,14 @@ Tests: python3 -m unittest discover -s tests -v
 
 `run(max_retries=n)` 为可选的按任务重试策略：`n` 表示每个任务在首次失败后允许再次调用的次数（默认 `0`，即每个任务只调用一次）。`n` 必须是非负整数（布尔值无效），非法值在任何任务执行前抛出 `ValueError`，且不影响上一轮 `execution_state()` 快照。任务抛异常时立即重试同一任务，重试预算按任务独立计算；每次尝试都收到只含直接依赖结果的全新映射。耗尽次数仍失败时抛出 `TaskExecutionError`（`task_name`、`original` 与 `__cause__` 均指向最后一次异常），下游任务不执行。
 
+## Per-task retry limits
+
+`run(retry_limits={...})` 增加一个仅限关键字传入的映射，将任务名映射到非负整数，为单个任务覆盖 `max_retries`：映射中的数值表示该任务首次失败后允许再次调用的次数，没有映射项的任务继续使用 `max_retries`。省略或传入 `None` 时完全保持统一的 `max_retries` 行为，位置参数解释不变。每个任务的预算独立计算，不因其他任务消耗预算而改变；每次尝试仍收到只含直接依赖结果的全新输入映射，返回映射键序仍遵循稳定拓扑序。
+
+`retry_limits` 的整体校验在排序、调用任务和替换最近一次 `execution_state()` 快照之前完成：输入不是映射、键不是字符串、值不是非布尔整数时抛出 `TypeError`；负数值抛出 `ValueError`；引用未注册任务的键抛出 `KeyError`。这些输入错误均不执行任何任务，也不改变图或上一份快照。校验与 `targets` 协同：映射中未被目标闭包选中的合法任务可以保留但不生效，闭包内任务按各自配置独立计算重试次数。
+
+任务耗尽自己的预算仍抛异常时沿用既有失败语义（`continue_on_error` 的快速失败/继续执行、`TaskExecutionError` 指向最后一次异常、失败记录最后一次异常的 `type` 与 `message`、重试成功只显示最终结果），并与 `max_concurrency` 并发调度完全兼容。
+
 ## Continue-on-error scheduling
 
 `run(continue_on_error=True)` 开启可选的非快速失败调度（默认 `False`，既有快速失败语义完全不变）。运行仍严格按稳定拓扑序推进，每次任务调用仍只接收由直接依赖结果组成的全新映射，重试预算仍按任务独立计算。
