@@ -78,3 +78,19 @@ Tests: python3 -m unittest discover -s tests -v
 
 取消不改变图结构：重试预算、目标闭包、直接依赖输入、优先级拓扑键序与成功返回键序的既有语义均不受影响；后续不传入 `cancel_check` 的 `run` 仍全新执行。`plan` 不接受也不会调用该回调。
 
+## Resumable execution
+
+`run(resume=True)` 增加一个仅限关键字传入的布尔开关（省略或传 `False` 时，`run` 的位置参数、校验、调用与快照语义与历史行为完全一致：每次都新建快照并重调全部任务）。非布尔值（`0`、`1`、字符串、`None` 等）在排序、任务调用与快照替换之前抛出 `TypeError` 并保留上一份 `execution_state()` 快照。
+
+`resume=True` 时先完成既有的参数校验与整图校验（缺失依赖 `KeyError`、环 `ValueError` 等照常先于恢复判定），再确认运行快照：
+
+- 此前没有任何运行快照（仅 `plan`/`order`/`add` 不算运行；空图成功运行也会留下快照）时抛 `TaskResumeError`，`reason="no_previous_run"`。
+- 快照生成时的任务名称集合、任一任务的直接依赖或 `priority` 与当前图不同时抛同一异常，`reason="graph_changed"`。
+- 图结构未变但本次 `targets` 规范化后的闭包成员集合与快照范围不同时抛同一异常，`reason="scope_changed"`。
+
+以上拒绝都发生在任何任务调用与快照替换之前，旧快照原样保留。
+
+通过确认后，仅复用快照中 `status` 为 `completed` 的节点：这些任务不会被再次调用，不占用 `max_concurrency` 名额，也不参与取消轮询；其旧结果直接进入下游输入映射与返回映射。`failed`、`pending`、`cancelled` 节点清除旧的 `result`/`error`，按同一套优先级拓扑序重新调度：只有全部直接依赖（含复用节点）成功后才启动；旧失败曾阻塞的下游节点，在依赖本次恢复成功后也会参加执行。被重调的任务继续收到只含直接依赖结果的全新映射（键仍按直接依赖名称升序），`max_retries` 与 `retry_limits` 按本次恢复重新计数，上一轮已消耗的尝试不计入；结果映射与快照记录都按优先级拓扑序排列，并同时保留复用结果与新结果。
+
+恢复运行完全兼容 `max_concurrency`、`continue_on_error` 与 `cancel_check`：分批时每批只从未完成节点中挑选，复用的完成节点不占名额；快速失败、继续执行、`TaskExecutionError`（以优先级拓扑序最早失败节点为主体）、失败记录以及依赖失败节点保持 `pending` 的规则全部沿用；取消时复用节点保持 `completed`，`TaskCancelledError.task_names` 只按优先级拓扑序列出本次尚未启动的节点，其余状态沿用既有取消规则；回调自身抛异常仍包装为 `TaskControlError`。若成功恢复后闭包内节点已全部为 `completed`，则不调用任何任务，直接按原序返回全部结果并保留旧快照。`plan`、`order`、`add` 以及不传 `resume` 的 `run` 均不受影响；`execution_state()` 仍返回相互独立的快照副本。
+

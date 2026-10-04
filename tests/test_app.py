@@ -5,6 +5,7 @@ from app import (
     TaskExecutionError,
     TaskCancelledError,
     TaskControlError,
+    TaskResumeError,
 )
 
 
@@ -2429,6 +2430,533 @@ class PriorityTest(unittest.TestCase):
         self.assertEqual(results["down"], "ok!")
         self.assertIsNot(raw[0], raw[1])
         self.assertEqual(seen, [{"dep": 1}, {"dep": 1}])
+
+
+class ResumeTest(unittest.TestCase):
+    def _chain(self, fail=None):
+        # Priority topological order: a, d, b, c (b depends on a, c on b;
+        # d is an independent root). ``fail`` maps a task name to the
+        # number of calls that fail before it starts succeeding; a large
+        # number stands in for a permanent failure.
+        calls = []
+        remaining = dict(fail or {})
+
+        def make(name, failures=None):
+            left = {} if failures is None else dict(failures)
+
+            def task(r):
+                calls.append(name)
+                if left.get(name, 0) > 0:
+                    left[name] -= 1
+                    raise RuntimeError(name + " boom")
+                if r:
+                    return name + ":" + ",".join(
+                        "%s=%s" % (k, r[k]) for k in sorted(r)
+                    )
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a", remaining))
+        g.add("d", make("d", remaining))
+        g.add("b", make("b", remaining), depends=["a"])
+        g.add("c", make("c", remaining), depends=["b"])
+        return g, calls, make
+
+    # --- default-off / parameter validation -------------------------
+
+    def test_resume_is_keyword_only_and_defaults_off(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        # A seventh positional argument is rejected even though it is a
+        # bool: resume must be passed by keyword.
+        with self.assertRaises(TypeError):
+            g.run(0, False, None, 1, None, None, True)
+        # Default and explicit False both execute everything afresh.
+        calls = []
+        g2 = TaskGraph()
+        g2.add("a", lambda r: calls.append("a") or 1)
+        g2.add("b", lambda r: calls.append("b") or r["a"] + 1, depends=["a"])
+        self.assertEqual(g2.run(), {"a": 1, "b": 2})
+        self.assertEqual(g2.run(resume=False), {"a": 1, "b": 2})
+        self.assertEqual(calls, ["a", "b", "a", "b"])
+
+    def test_non_boolean_resume_rejected_and_snapshot_preserved(self):
+        for bad in (0, 1, "true", None, 1.0, ["x"], ()):
+            g, calls, make = self._chain()
+            self.assertEqual(
+                g.run(),
+                {"a": "a", "d": "d", "b": "b:a=a", "c": "c:b=b:a=a"},
+            )
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(resume=bad)
+            self.assertIn("resume", str(ctx.exception))
+            self.assertEqual(g.execution_state(), before)
+        # No task was called by any rejected invocation.
+        self.assertEqual(calls, ["a", "d", "b", "c"])
+
+    def test_parameter_and_graph_validation_precede_snapshot_check(self):
+        # A fresh graph rejects resume=True with no_previous_run only after
+        # every other parameter would validate; bad parameters still raise
+        # their own errors first.
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        with self.assertRaises(ValueError):
+            g.run(max_retries=-1, resume=True)
+        with self.assertRaises(TypeError):
+            g.run(continue_on_error=1, resume=True)
+        with self.assertRaises(KeyError):
+            g.run(retry_limits={"ghost": 1}, resume=True)
+        # A whole-graph structural error discovered during ordering also
+        # precedes the snapshot confirmation.
+        g.run()
+        g.add("late", lambda r: None, depends=["missing"])
+        before = g.execution_state()
+        with self.assertRaises(KeyError):
+            g.run(resume=True)
+        self.assertEqual(g.execution_state(), before)
+
+    # --- snapshot confirmation rejections ----------------------------
+
+    def test_no_previous_run_on_fresh_graph_and_after_plan_only(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "no_previous_run")
+        g.plan()
+        g.order()
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "no_previous_run")
+        self.assertEqual(g.execution_state(), {})
+
+    def test_empty_graph_run_then_resume_returns_empty(self):
+        g = TaskGraph()
+        self.assertEqual(g.run(), {})
+        self.assertEqual(g.run(resume=True), {})
+        self.assertEqual(g.execution_state(), {})
+
+    def test_graph_changed_when_task_added_removed_or_rewired(self):
+        def snapshot_before():
+            g, _, _ = self._chain()
+            g.run()
+            return g, g.execution_state()
+
+        # A newly registered task changes the graph identity.
+        g, before = snapshot_before()
+        g.add("new", lambda r: 1)
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "graph_changed")
+        self.assertEqual(g.execution_state(), before)
+
+        # A changed priority changes the graph identity.
+        g, before = snapshot_before()
+        g.priorities["a"] = 9
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "graph_changed")
+        self.assertEqual(g.execution_state(), before)
+
+        # A changed dependency set changes the graph identity.
+        g, before = snapshot_before()
+        g.deps["b"].add("d")
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "graph_changed")
+        self.assertEqual(g.execution_state(), before)
+
+        # A removed task changes the graph identity.
+        g, before = snapshot_before()
+        del g.tasks["c"]
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "graph_changed")
+        self.assertEqual(g.execution_state(), before)
+
+        # An unchanged graph resumes without error.
+        g, _ = snapshot_before()
+        self.assertEqual(
+            g.run(resume=True),
+            {"a": "a", "d": "d", "b": "b:a=a", "c": "c:b=b:a=a"},
+        )
+
+    def test_graph_changed_takes_precedence_over_scope_changed(self):
+        g, _, _ = self._chain()
+        g.run(targets=["a"])
+        g.add("new", lambda r: 1)
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(targets=["c"], resume=True)
+        self.assertEqual(ctx.exception.reason, "graph_changed")
+
+    def test_scope_changed_when_targets_closure_differs(self):
+        g, _, _ = self._chain()
+        g.run(targets=["a"])
+        before = g.execution_state()
+        self.assertEqual(set(before), {"a"})
+        for bad_targets in (["b"], ["c"], ["a", "d"]):
+            with self.assertRaises(TaskResumeError) as ctx:
+                g.run(targets=bad_targets, resume=True)
+            self.assertEqual(ctx.exception.reason, "scope_changed")
+            self.assertEqual(g.execution_state(), before)
+        # The identical normalized scope resumes fine.
+        self.assertEqual(g.run(targets=["a", "a"], resume=True), {"a": "a"})
+
+    def test_rejection_calls_no_task_and_keeps_old_snapshot(self):
+        g, calls, make = self._chain(fail={"b": 100})
+        with self.assertRaises(TaskExecutionError):
+            g.run(continue_on_error=True)
+        before = g.execution_state()
+        g.add("late", lambda r: calls.append("late") or 1)
+        with self.assertRaises(TaskResumeError):
+            g.run(resume=True, continue_on_error=True)
+        self.assertEqual(calls, ["a", "d", "b"])  # "late" never ran
+        self.assertEqual(g.execution_state(), before)
+
+    # --- reuse semantics ----------------------------------------------
+
+    def test_completed_nodes_reused_others_rerun_in_topological_order(self):
+        g, calls, make = self._chain(fail={"b": 1})
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True)
+        self.assertEqual(ctx.exception.task_name, "b")
+        self.assertEqual(calls, ["a", "d", "b"])
+        self.assertEqual(
+            {k: v["status"] for k, v in g.execution_state().items()},
+            {"a": "completed", "d": "completed",
+             "b": "failed", "c": "pending"},
+        )
+        # Fix b; on resume a and d are reused (no new calls), b reruns and
+        # receives a's reused result, c (previously pending) now runs.
+        g.tasks["b"] = make("b")
+        results = g.run(resume=True)
+        self.assertEqual(calls, ["a", "d", "b", "b", "c"])
+        self.assertEqual(list(results), ["a", "d", "b", "c"])
+        self.assertEqual(results["a"], "a")
+        self.assertEqual(results["b"], "b:a=a")
+        self.assertEqual(results["c"], "c:b=b:a=a")
+        state = g.execution_state()
+        self.assertTrue(
+            all(v["status"] == "completed" for v in state.values())
+        )
+        self.assertIsNone(state["b"]["error"])
+
+    def test_fast_failure_resume_keeps_downstream_pending_on_refailure(self):
+        g, calls, make = self._chain(fail={"b": 100})
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        # b still fails on resume: a/d stay reused, b is re-failed, c
+        # never starts and keeps pending.
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.task_name, "b")
+        self.assertEqual(calls, ["a", "d", "b", "b"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["d"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "failed")
+        self.assertIsNone(state["b"]["result"])
+        self.assertEqual(
+            state["b"]["error"],
+            {"type": "RuntimeError", "message": "b boom"},
+        )
+        self.assertEqual(
+            state["c"], {"status": "pending", "result": None, "error": None}
+        )
+
+    def test_cancelled_and_pending_nodes_are_rerun_but_completed_reused(self):
+        g, calls, make = self._chain()
+        polls = []
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(cancel_check=lambda: (polls.append(1), len(polls) >= 3)[1])
+        self.assertEqual(ctx.exception.task_names, ["b", "c"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["d"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "cancelled")
+        self.assertEqual(state["c"]["status"], "cancelled")
+        results = g.run(resume=True)
+        self.assertEqual(calls, ["a", "d", "b", "c"])  # a/d not re-called
+        self.assertEqual(list(results), ["a", "d", "b", "c"])
+        self.assertTrue(
+            all(v["status"] == "completed"
+                for v in g.execution_state().values())
+        )
+
+    def test_retry_budgets_are_counted_afresh_per_resume(self):
+        attempts = {"n": 0}
+
+        def always(r):
+            attempts["n"] += 1
+            raise RuntimeError("always %d" % attempts["n"])
+
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", always, depends=["a"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(max_retries=1)
+        self.assertEqual(attempts["n"], 2)
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(resume=True, max_retries=1)
+        self.assertEqual(str(ctx.exception.original), "always 4")
+        self.assertEqual(attempts["n"], 4)  # two fresh attempts, not zero
+
+    def test_retry_limits_apply_fresh_on_resume(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] < 4:  # run 1 burns its one attempt; resume's
+                raise RuntimeError("once")  # retries land on attempt 4
+            return "ok"
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        with self.assertRaises(TaskExecutionError):
+            g.run(retry_limits={"flaky": 0})
+        self.assertEqual(attempts["n"], 1)
+        self.assertEqual(
+            g.run(resume=True, retry_limits={"flaky": 2}),
+            {"flaky": "ok"},
+        )
+        self.assertEqual(attempts["n"], 4)
+
+    def test_each_resume_attempt_gets_fresh_input_mapping(self):
+        raw, seen = [], []
+        attempt = {"n": 0}
+
+        def flaky(r):
+            raw.append(r)
+            seen.append(dict(r))
+            r["polluted"] = True
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                raise RuntimeError("resume once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("flaky", flaky, depends=["a"])
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        self.assertEqual(g.run(resume=True, max_retries=1)["flaky"], "ok")
+        self.assertIsNot(raw[0], raw[1])
+        self.assertEqual(seen, [{"a": 1}, {"a": 1}])
+
+    def test_all_completed_resume_calls_nothing_and_keeps_snapshot(self):
+        g, calls, make = self._chain()
+        g.run()
+        before = g.execution_state()
+        results = g.run(
+            resume=True, cancel_check=lambda: self.fail("must not poll")
+        )
+        self.assertEqual(list(results), ["a", "d", "b", "c"])
+        self.assertEqual(calls, ["a", "d", "b", "c"])
+        self.assertEqual(g.execution_state(), before)
+        # Resuming repeatedly stays a no-op.
+        self.assertEqual(g.run(resume=True), results)
+
+    def test_resume_is_independently_resumable_and_snapshot_independent(self):
+        g, calls, make = self._chain(fail={"b": 1})
+        with self.assertRaises(TaskExecutionError):
+            g.run(continue_on_error=True)
+        g.tasks["b"] = make("b")
+        g.run(resume=True, continue_on_error=True)
+        self.assertEqual(g.run(resume=True)["c"], "c:b=b:a=a")
+        snapshot = g.execution_state()
+        snapshot["a"]["result"] = "tampered"
+        snapshot["new"] = {}
+        again = g.execution_state()
+        self.assertEqual(again["a"]["result"], "a")
+        self.assertNotIn("new", again)
+
+    def test_fresh_run_after_resume_replaces_snapshot(self):
+        g, calls, make = self._chain(fail={"b": 100})
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        # A non-resume run starts from scratch and fails the same way.
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run()
+        self.assertEqual(ctx.exception.task_name, "b")
+        self.assertEqual(calls, ["a", "d", "b", "a", "d", "b"])
+        self.assertEqual(
+            g.execution_state()["c"],
+            {"status": "pending", "result": None, "error": None},
+        )
+
+    def test_resume_within_targets_closure(self):
+        calls = []
+
+        def boom(r):
+            calls.append("b")
+            raise RuntimeError("boom")
+
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", boom, depends=["a"])
+        g.add("c", lambda r: calls.append("c") or r["b"] + 1, depends=["b"])
+        g.add("outside", lambda r: calls.append("outside") or 9)
+        with self.assertRaises(TaskExecutionError):
+            g.run(targets=["c"])
+        self.assertEqual(calls, ["a", "b"])
+        g.tasks["b"] = lambda r: calls.append("b") or 2
+        results = g.run(targets=["c"], resume=True)
+        self.assertEqual(results, {"a": 1, "b": 2, "c": 3})
+        self.assertEqual(list(results), ["a", "b", "c"])
+        self.assertEqual(calls, ["a", "b", "b", "c"])  # outside never ran
+        self.assertEqual(set(g.execution_state()), {"a", "b", "c"})
+
+    # --- cancellation / control errors during resume -----------------
+
+    def test_resume_cancel_keeps_reused_and_lists_only_unstarted(self):
+        g, calls, make = self._chain(fail={"b": 100})
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(resume=True, cancel_check=lambda: True)
+        # a/d were reused (not listed); b and c never start this run.
+        self.assertEqual(ctx.exception.task_names, ["b", "c"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["d"]["status"], "completed")
+        for name in ("b", "c"):
+            self.assertEqual(
+                state[name],
+                {"status": "cancelled", "result": None, "error": None},
+            )
+        self.assertEqual(calls, ["a", "d", "b"])  # b was never invoked
+
+    def test_resume_cancel_after_rerun_failure_with_continue_on_error(self):
+        # Order: a, boom, late, down (down depends on boom). The first
+        # run continues on error: a completes, boom fails, and the third
+        # poll (before late) cancels, leaving late/down cancelled.
+        def boom(r):
+            raise RuntimeError("boom")
+
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("boom", boom)
+        g.add("late", lambda r: calls.append("late") or 2)
+        g.add("down", lambda r: calls.append("down") or 3, depends=["boom"])
+        polls1 = []
+        with self.assertRaises(TaskCancelledError):
+            g.run(continue_on_error=True,
+                  cancel_check=lambda: (polls1.append(1),
+                                        len(polls1) >= 3)[1])
+        # Resume: a is reused (never polled); boom reruns at poll 1 and
+        # fails again; at poll 2 (before late) cancellation wins. late and
+        # the boom-blocked down are the unstarted names.
+        polls2 = []
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(resume=True, continue_on_error=True,
+                  cancel_check=lambda: (polls2.append(1),
+                                        len(polls2) >= 2)[1])
+        self.assertEqual(ctx.exception.task_names, ["late", "down"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["a"]["result"], 1)
+        self.assertEqual(state["boom"]["status"], "failed")
+        self.assertEqual(
+            state["boom"]["error"],
+            {"type": "RuntimeError", "message": "boom"},
+        )
+        self.assertEqual(state["late"]["status"], "cancelled")
+        self.assertEqual(state["down"]["status"], "cancelled")
+        self.assertEqual(calls, ["a"])  # late/down never started
+
+    def test_resume_control_error_keeps_reused_completed(self):
+        g, calls, make = self._chain(fail={"b": 100})
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        with self.assertRaises(TaskControlError) as ctx:
+            g.run(resume=True, cancel_check=lambda: (_ for _ in ()).throw(
+                RuntimeError("control")))
+        self.assertIsInstance(ctx.exception.original, RuntimeError)
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["d"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "cancelled")
+        self.assertEqual(state["c"]["status"], "cancelled")
+
+    # --- concurrency --------------------------------------------------
+
+    def test_concurrent_resume_reuses_completed_without_occupying_slots(self):
+        import threading
+        import time
+
+        lock = threading.Lock()
+        current = {"n": 0}
+        peak = {"n": 0}
+
+        def slow(name):
+            def task(r):
+                with lock:
+                    current["n"] += 1
+                    peak["n"] = max(peak["n"], current["n"])
+                time.sleep(0.08)
+                with lock:
+                    current["n"] -= 1
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("d", lambda r: 4)
+        g.add("f", lambda r: (_ for _ in ()).throw(RuntimeError("f")))
+        g.add("g", lambda r: (_ for _ in ()).throw(RuntimeError("g")))
+        g.add("b", lambda r: r["a"] + 1, depends=["a", "f", "g"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(max_concurrency=2, continue_on_error=True)
+        g.tasks["f"] = slow("f")
+        g.tasks["g"] = slow("g")
+        results = g.run(
+            resume=True, max_concurrency=2, continue_on_error=True
+        )
+        self.assertEqual(results, {"a": 1, "d": 4, "f": "f", "g": "g",
+                                   "b": 2})
+        self.assertEqual(list(results), ["a", "d", "f", "g", "b"])
+        # The two rerun roots share the first resumed batch: reused a/d
+        # consumed none of the two slots.
+        self.assertEqual(peak["n"], 2)
+
+    def test_concurrent_resume_results_and_snapshot_follow_topology(self):
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("x", lambda r: calls.append("x") or 10)
+        g.add("f", lambda r: (_ for _ in ()).throw(RuntimeError("f")))
+        g.add("b", lambda r: calls.append("b") or r["a"] + r["f"],
+              depends=["a", "f"])
+        # order(): the name-sorted roots are a, f, x; b joins last.
+        self.assertEqual(g.order(), ["a", "f", "x", "b"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(max_concurrency=2, continue_on_error=True)
+        g.tasks["f"] = lambda r: calls.append("f") or 2
+        results = g.run(resume=True, max_concurrency=2,
+                        continue_on_error=True)
+        self.assertEqual(list(results), ["a", "f", "x", "b"])
+        self.assertEqual(results["b"], 3)
+        # First run called a and x (f raised); the resume calls only f and
+        # b because a and x are reused.
+        self.assertEqual(calls, ["a", "x", "f", "b"])
+        self.assertEqual(list(g.execution_state()), ["a", "f", "x", "b"])
+
+    def test_concurrent_resume_cancel_names_exclude_reused(self):
+        g, calls, make = self._chain(fail={"b": 100})
+        with self.assertRaises(TaskExecutionError):
+            g.run(max_concurrency=2, continue_on_error=True)
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(resume=True, max_concurrency=2, continue_on_error=True,
+                   cancel_check=lambda: True)
+        self.assertEqual(ctx.exception.task_names, ["b", "c"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["d"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "cancelled")
+        self.assertEqual(state["c"]["status"], "cancelled")
 
 
 if __name__ == "__main__":

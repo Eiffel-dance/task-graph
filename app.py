@@ -50,12 +50,37 @@ class TaskControlError(Exception):
         )
 
 
+class TaskResumeError(Exception):
+    """Raised when run(resume=True) cannot resume from the last snapshot.
+
+    reason is one of:
+      - "no_previous_run": no snapshot from a previous run exists;
+      - "graph_changed": the task set, a task's dependencies or a
+        task's priority differ from when the snapshot was taken;
+      - "scope_changed": the normalized targets closure differs from
+        the scope the snapshot was taken for.
+
+    The previous snapshot is always preserved when this is raised.
+    """
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__("cannot resume run: %s" % reason)
+
+
 class TaskGraph:
     def __init__(self):
         self.tasks = {}
         self.deps = defaultdict(set)
         self.priorities = {}
         self._state = {}
+        # Whole-graph structural fingerprint captured alongside every
+        # snapshot: the set of (name, sorted dependencies, priority)
+        # triples for every registered task. resume=True compares a
+        # fresh fingerprint to this one (and the snapshot's scope)
+        # before reusing anything, so a structural or targets-closure
+        # change is rejected while the old snapshot stays in place.
+        self._state_fingerprint = None
 
     def add(self, name, fn, depends=(), *, priority=0):
         # Validate everything before mutating anything: a rejected
@@ -271,7 +296,8 @@ class TaskGraph:
         return self._resolve_run_order(targets)
 
     def run(self, max_retries=0, continue_on_error=False, *, targets=None,
-            max_concurrency=1, retry_limits=None, cancel_check=None):
+            max_concurrency=1, retry_limits=None, cancel_check=None,
+            resume=False):
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -285,6 +311,14 @@ class TaskGraph:
         # previous run's snapshot is left untouched.
         if not isinstance(continue_on_error, bool):
             raise TypeError("continue_on_error must be a boolean")
+        # resume is keyword-only, so the positional interpretation of the
+        # historical arguments never changes. False (the default) keeps the
+        # historical fresh-run semantics exactly: a brand-new snapshot is
+        # taken and every task is called. A strictly boolean value is
+        # required; anything else is rejected before ordering, execution or
+        # state replacement so the previous snapshot is left untouched.
+        if not isinstance(resume, bool):
+            raise TypeError("resume must be a boolean")
         # max_concurrency is keyword-only, so the positional interpretation
         # of the historical arguments never changes. The default of 1 keeps
         # the sequential scheduler; only a positive integer above 1 enables
@@ -325,19 +359,51 @@ class TaskGraph:
         # topological sequence this run covers — the exact sequence plan()
         # would preview for the same graph and targets.
         run_order = self._resolve_run_order(targets)
-        # Fresh snapshot per run covering exactly the executed closure:
-        # no records leak from previous runs or from unselected nodes.
-        state = {
-            name: {"status": "pending", "result": None, "error": None}
-            for name in run_order
-        }
+        reused = set()
+        if resume:
+            # Validate the resumability of the existing snapshot fully
+            # before any task is called or the snapshot is replaced:
+            # no snapshot at all (no_previous_run), a structural change
+            # (graph_changed) or a different targets closure
+            # (scope_changed) raise TaskResumeError and leave the old
+            # snapshot exactly in place. Only "completed" records are
+            # reusable; failed/pending/cancelled nodes are re-executed.
+            reused = self._prepare_resume(run_order)
+            if len(reused) == len(run_order):
+                # Everything in scope already completed: no task is
+                # called, results come back in priority topological
+                # order, and the previous snapshot is retained as-is.
+                return {
+                    name: self._state[name]["result"] for name in run_order
+                }
+        # Fresh snapshot for the work this invocation performs. Reused
+        # nodes keep a completed record carrying their old result; every
+        # other node starts from an empty pending placeholder, so old
+        # failed/cancelled result/error values never linger. The
+        # snapshot covers exactly the executed closure.
+        state = {}
+        for name in run_order:
+            if name in reused:
+                state[name] = {
+                    "status": "completed",
+                    "result": self._state[name]["result"],
+                    "error": None,
+                }
+            else:
+                state[name] = {
+                    "status": "pending", "result": None, "error": None
+                }
         self._state = state
+        self._state_fingerprint = self._fingerprint()
         if max_concurrency > 1:
             return self._run_concurrent(
                 run_order, state, max_retries, continue_on_error,
-                max_concurrency, limits, cancel_check,
+                max_concurrency, limits, cancel_check, reused,
             )
-        results = {}
+        results = {
+            name: state[name]["result"]
+            for name in run_order if name in reused
+        }
         # "dead" nodes are failures plus everything that can no longer run
         # because it (transitively) depends on one. The run still advances
         # strictly in priority topological order.
@@ -345,30 +411,37 @@ class TaskGraph:
         failures = []
         failure_errors = {}
         for name in run_order:
+            # Reused successes are settled output of a previous run: they
+            # are never called again, spend no concurrency slot and are
+            # neither polled for cancellation nor eligible for "dead".
+            if name in reused:
+                continue
             # Any direct dependency that failed or was skipped marks this
             # node as unreachable; it is never called and keeps the empty
             # pending placeholder (result/error both None).
             if self.deps[name] & dead:
                 dead.add(name)
                 continue
-            # Cooperative cancellation is consulted exactly once per task,
-            # in priority topological order, immediately before that task
-            # starts — never for unreachable nodes and never between
-            # retries. A truthy result spends none of this task's retries;
-            # a raising callback aborts as TaskControlError.
+            # Cooperative cancellation is consulted exactly once per task
+            # that (re)starts this run, in priority topological order,
+            # immediately before that task starts — never for reused
+            # nodes or unreachable nodes and never between retries. A
+            # truthy result spends none of this task's retries; a raising
+            # callback aborts as TaskControlError.
             if cancel_check is not None:
                 if self._poll_cancel(cancel_check, run_order, state):
                     cancelled = self._mark_cancelled(run_order, state)
                     raise TaskCancelledError(cancelled)
             state[name]["status"] = "running"
-            # Retry budgets are per task: a retry_limits entry overrides
-            # max_retries for this task alone, and each task's budget is
-            # independent of every other task's attempts.
+            # Retry budgets are per task and counted afresh for this
+            # recovery: a retry_limits entry overrides max_retries for
+            # this task alone, and attempts spent in the previous run do
+            # not carry over.
             budget = limits.get(name, max_retries)
             for attempt in range(budget + 1):
-                # Each attempt receives a brand-new mapping containing only
-                # its declared upstream values; ordering keys keeps calls
-                # reproducible.
+                # Each attempt receives a brand-new mapping containing
+                # only its declared upstream values (reused or freshly
+                # computed); ordering keys keeps calls reproducible.
                 inputs = {d: results[d] for d in sorted(self.deps[name])}
                 try:
                     value = self.tasks[name](inputs)
@@ -398,7 +471,43 @@ class TaskGraph:
             first = failures[0]
             original = failure_errors[first]
             raise TaskExecutionError(first, original) from original
-        return results
+        # Reused entries were seeded before any new completion, so order
+        # the returned mapping by the priority topological sequence.
+        return {name: results[name] for name in run_order}
+
+    def _fingerprint(self):
+        # Structural identity of the complete graph at snapshot time:
+        # every registered task's name, direct dependencies
+        # (order-normalized) and priority. The fingerprint deliberately
+        # covers the whole graph (not just one targets closure) so that
+        # adding, removing or re-wiring any task — inside or outside
+        # the resumed closure — is a graph change, while a different
+        # targets closure on an untouched graph is a scope change.
+        return frozenset(
+            (name, tuple(sorted(self.deps[name])), self.priorities[name])
+            for name in self.tasks
+        )
+
+    def _prepare_resume(self, run_order):
+        # Verify resume=True against the most recent snapshot without
+        # calling any task or replacing the snapshot. Returns the set of
+        # nodes whose completed result may be reused.
+        if self._state_fingerprint is None:
+            raise TaskResumeError("no_previous_run")
+        # Structural identity is checked first, then scope: a changed
+        # task name set, dependency set or priority is graph_changed
+        # even when the requested closure also differs; an untouched
+        # graph whose normalized targets closure is a different member
+        # set is scope_changed.
+        if self._fingerprint() != self._state_fingerprint:
+            raise TaskResumeError("graph_changed")
+        if set(run_order) != set(self._state):
+            raise TaskResumeError("scope_changed")
+        return {
+            name
+            for name in run_order
+            if self._state[name]["status"] == "completed"
+        }
 
     def _poll_cancel(self, cancel_check, run_order, state):
         # One polling point: the callback takes no arguments and any
@@ -430,7 +539,7 @@ class TaskGraph:
 
     def _run_concurrent(self, run_order, state, max_retries,
                         continue_on_error, max_concurrency, retry_limits,
-                        cancel_check=None):
+                        cancel_check=None, reused=frozenset()):
         """Batch scheduler used when max_concurrency > 1.
 
         Each round starts at most max_concurrency ready tasks — those whose
@@ -444,15 +553,22 @@ class TaskGraph:
         observable (input mappings, results key order, failure selection,
         state records) follows that priority topological order, never the
         order in which concurrent tasks happen to finish.
+
+        On a resumed run, reused nodes are already completed in state:
+        their results seed the mapping below, they never enter pending or
+        a batch and therefore never occupy a concurrency slot.
         """
         position = {name: i for i, name in enumerate(run_order)}
-        results = {}
+        results = {
+            name: state[name]["result"]
+            for name in run_order if name in reused
+        }
         # "dead" nodes are failures plus everything that can no longer run
         # because it (transitively) depends on one.
         dead = set()
         failures = []
         failure_errors = {}
-        pending = list(run_order)
+        pending = [name for name in run_order if name not in reused]
 
         def attempt(name):
             # Retry budgets are per task — a retry_limits entry overrides
