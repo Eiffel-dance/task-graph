@@ -2154,5 +2154,238 @@ class CancellationTest(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, TaskControlError)
 
 
+class PriorityTest(unittest.TestCase):
+    def _diamond(self, **prio):
+        # All-zero default order is the legacy FIFO-Kahn sequence:
+        # a, c, b, d, e. prio maps a task name to a priority override.
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1,
+              priority=prio.get("a", 0))
+        g.add("b", lambda r: calls.append("b") or r["a"] + 1, ["a"],
+              priority=prio.get("b", 0))
+        g.add("c", lambda r: calls.append("c") or 10,
+              priority=prio.get("c", 0))
+        g.add("d", lambda r: calls.append("d") or r["b"] + r["c"],
+              ["b", "c"], priority=prio.get("d", 0))
+        g.add("e", lambda r: calls.append("e") or r["d"] + 1, ["d"],
+              priority=prio.get("e", 0))
+        return g, calls
+
+    def test_priority_is_keyword_only_and_defaults_to_zero(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        self.assertEqual(g.order(), ["a", "b"])
+        with self.assertRaises(TypeError):
+            g.add("z", lambda r: None, (), 5)
+
+    def test_invalid_priority_type_raises_typeerror(self):
+        for bad in (True, False, 1.5, "1", None, [1], (1,), object()):
+            g = TaskGraph()
+            with self.assertRaises(TypeError) as ctx:
+                g.add("t", lambda r: None, priority=bad)
+            self.assertEqual(str(ctx.exception), "priority must be an integer")
+
+    def test_negative_and_large_integer_priorities_are_accepted(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1, priority=-10 ** 9)
+        g.add("b", lambda r: 2, priority=10 ** 9)
+        g.add("c", lambda r: 3, priority=0)
+        self.assertEqual(g.order(), ["b", "c", "a"])
+
+    def test_rejected_priority_preserves_graph_and_snapshot(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7)
+        self.assertEqual(g.run(), {"ok": 7})
+        before = g.execution_state()
+        for bad in (True, 1.5, "x", None):
+            with self.assertRaises(TypeError):
+                g.add("bad", lambda r: None, priority=bad)
+        self.assertEqual(set(g.tasks), {"ok"})
+        self.assertEqual(g.priorities, {"ok": 0})
+        self.assertEqual(g.order(), ["ok"])
+        self.assertEqual(g.execution_state(), before)
+
+    def test_preexisting_validations_keep_their_own_results(self):
+        # Priority validity is checked, but duplicate/empty/non-callable
+        # inputs still surface their original errors and never register.
+        g = TaskGraph()
+        g.add("x", lambda r: None, priority=5)
+        with self.assertRaises(ValueError) as ctx:
+            g.add("x", lambda r: None, priority=9)
+        self.assertIn("duplicate task", str(ctx.exception))
+        self.assertEqual(g.priorities["x"], 5)  # not overwritten
+        with self.assertRaises(ValueError):
+            g.add("", lambda r: None, priority=1)
+        with self.assertRaises(TypeError):
+            g.add("nc", None, priority=1)
+        self.assertEqual(set(g.tasks), {"x"})
+
+    def test_all_zero_priority_keeps_legacy_sequence_exactly(self):
+        g, calls = self._diamond()
+        self.assertEqual(g.order(), ["a", "c", "b", "d", "e"])
+        results = g.run()
+        self.assertEqual(list(results), ["a", "c", "b", "d", "e"])
+        self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+        self.assertEqual(
+            list(g.execution_state()), ["a", "c", "b", "d", "e"]
+        )
+
+    def test_higher_priority_ready_node_is_selected_first(self):
+        # b becomes ready right after a; with a higher priority it jumps
+        # ahead of the already-ready root c.
+        g, calls = self._diamond(b=10)
+        self.assertEqual(g.order(), ["a", "b", "c", "d", "e"])
+        self.assertEqual(g.plan(), ["a", "b", "c", "d", "e"])
+        results = g.run()
+        self.assertEqual(calls, ["a", "b", "c", "d", "e"])
+        self.assertEqual(list(results), ["a", "b", "c", "d", "e"])
+        self.assertEqual(
+            list(g.execution_state()), ["a", "b", "c", "d", "e"]
+        )
+        self.assertEqual(results, {"a": 1, "b": 2, "c": 10, "d": 12, "e": 13})
+
+    def test_dependency_always_precedes_its_successor(self):
+        # A very high-priority successor still waits for its low-priority
+        # direct dependency.
+        g = TaskGraph()
+        g.add("low", lambda r: 1, priority=-100)
+        g.add("high", lambda r: r["low"] + 1, ["low"], priority=100)
+        g.add("mid", lambda r: 5)
+        self.assertEqual(g.order(), ["mid", "low", "high"])
+        self.assertEqual(g.run(), {"mid": 5, "low": 1, "high": 2})
+
+    def test_equal_priority_tie_breaks_by_name_within_ready_wave(self):
+        g = TaskGraph()
+        g.add("zroot", lambda r: 1, priority=7)
+        g.add("aroot", lambda r: 2, priority=7)
+        g.add("mroot", lambda r: 3, priority=7)
+        self.assertEqual(g.order(), ["aroot", "mroot", "zroot"])
+
+    def test_order_plan_run_and_state_share_one_sequence(self):
+        g, _ = self._diamond(c=10, b=-5)
+        planned = g.plan()
+        ordered = g.order()
+        results = g.run(max_retries=1, continue_on_error=True)
+        self.assertEqual(planned, ordered)
+        self.assertEqual(list(results), planned)
+        self.assertEqual(list(g.execution_state()), planned)
+
+    def test_targets_validates_full_graph_then_projects_priority_order(self):
+        g, calls = self._diamond(b=10)
+        # Full-graph order is a,b,c,d,e; the d-closure is a,b,c,d.
+        self.assertEqual(g.plan(["d"]), ["a", "b", "c", "d"])
+        results = g.run(targets=["d"])
+        self.assertEqual(list(results), ["a", "b", "c", "d"])
+        self.assertEqual(calls, ["a", "b", "c", "d"])  # e never runs
+        self.assertEqual(set(g.execution_state()), {"a", "b", "c", "d"})
+
+    def test_bad_graph_outside_targets_closure_still_rejected(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1, priority=10)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.add("z", lambda r: None, ["ghost"], priority=99)
+        with self.assertRaises(KeyError):
+            g.order()
+        with self.assertRaises(KeyError):
+            g.plan(["b"])
+        with self.assertRaises(KeyError):
+            g.run(targets=["b"])
+        self.assertEqual(g.execution_state(), {})
+
+    def test_task_inputs_remain_sorted_direct_dependencies(self):
+        seen = {}
+        g = TaskGraph()
+        g.add("root", lambda r: 1, priority=-3)
+        g.add("zzz", lambda r: 2, priority=9)
+
+        def join(r):
+            seen["keys"] = list(r)
+            return sum(r.values())
+
+        g.add("join", join, ["zzz", "root"], priority=4)
+        self.assertEqual(g.run(), {"zzz": 2, "root": 1, "join": 3})
+        # Priority changed the call order but not the input mapping keys.
+        self.assertEqual(seen["keys"], ["root", "zzz"])
+
+    def test_concurrent_batches_take_first_k_ready_by_priority(self):
+        import threading
+
+        # Three independent roots are ready together. With k=2 the batch
+        # must be the two highest-priority roots; the lowest-priority one
+        # waits for the next round even though a worker could take it.
+        started = []
+        gate = threading.Event()
+        lock = threading.Lock()
+
+        def make(name):
+            def task(r):
+                with lock:
+                    started.append(name)
+                gate.wait(timeout=2)
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a"))            # priority 0  -> waits
+        g.add("m", make("m"), priority=5)
+        g.add("b", make("b"), priority=10)
+        order = g.order()
+        self.assertEqual(order, ["b", "m", "a"])
+        thread = threading.Thread(
+            target=lambda: g.run(max_concurrency=2)
+        )
+        thread.start()
+        # Give the first batch a moment to launch; "a" must not be among it.
+        import time
+        time.sleep(0.15)
+        self.assertEqual(sorted(started), ["b", "m"])
+        gate.set()
+        thread.join()
+        self.assertEqual(sorted(started), ["a", "b", "m"])
+
+    def test_concurrent_results_order_ignores_completion_timing(self):
+        import time
+
+        def slow(r):
+            time.sleep(0.1)
+            return "slow"
+
+        g = TaskGraph()
+        g.add("a", slow, priority=10)
+        g.add("b", lambda r: "fast")
+        g.add("c", lambda r: r["a"] + r["b"], ["a", "b"])
+        results = g.run(max_concurrency=2)
+        self.assertEqual(list(results), ["a", "b", "c"])
+        self.assertEqual(
+            results, {"a": "slow", "b": "fast", "c": "slowfast"}
+        )
+
+    def test_earliest_failure_reported_in_priority_order(self):
+        def fail(letter):
+            def task(r):
+                raise ValueError("err " + letter)
+            return task
+
+        g = TaskGraph()
+        # Ready order: hi (prio) then a,b; the first failure is hi.
+        g.add("hi", fail("hi"), priority=10)
+        g.add("a", fail("a"))
+        g.add("b", fail("b"))
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True)
+        self.assertEqual(ctx.exception.task_name, "hi")
+        self.assertEqual(str(ctx.exception.original), "err hi")
+
+    def test_cancel_names_follow_priority_order(self):
+        g, _ = self._diamond(b=10)
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(cancel_check=lambda: True)
+        self.assertEqual(
+            ctx.exception.task_names, ["a", "b", "c", "d", "e"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

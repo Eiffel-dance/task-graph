@@ -1,4 +1,5 @@
-from collections import defaultdict, deque
+import heapq
+from collections import defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -22,7 +23,7 @@ class TaskExecutionError(Exception):
 class TaskCancelledError(Exception):
     """Raised when a run is stopped cooperatively via cancel_check.
 
-    task_names lists, in stable topological order, every node of the
+    task_names lists, in priority topological order, every node of the
     run's closure that had not started when cancellation took effect;
     their snapshot records carry status "cancelled" with result and
     error both None.
@@ -54,11 +55,13 @@ class TaskGraph:
     def __init__(self):
         self.tasks = {}
         self.deps = defaultdict(set)
+        self.priorities = {}
         self._state = {}
 
-    def add(self, name, fn, depends=()):
+    def add(self, name, fn, depends=(), *, priority=0):
         # Validate everything before mutating anything: a rejected
-        # registration must leave tasks, deps and execution_state untouched.
+        # registration must leave tasks, deps, priorities and
+        # execution_state untouched.
         if not isinstance(name, str):
             raise TypeError("task name must be a string")
         if not name:
@@ -80,10 +83,16 @@ class TaskGraph:
                 raise TypeError("dependency name must be a string")
             if not dep:
                 raise ValueError("dependency name must not be empty")
+        # Priority is keyword-only and optional, defaulting to 0. It is a
+        # plain integer (booleans are ints but True/False is never a
+        # meaningful priority) and may be negative; larger values win.
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise TypeError("priority must be an integer")
         if name in self.tasks:
             raise ValueError("duplicate task")
         self.tasks[name] = fn
         self.deps[name] = set(dep_names)
+        self.priorities[name] = priority
 
     def _check_dependencies(self):
         # Dependencies may be registered after the task that names them,
@@ -98,25 +107,43 @@ class TaskGraph:
                 )
 
     def order(self):
+        # Priority topological order: a node is only selectable once every
+        # direct dependency has been emitted, and among the ready nodes the
+        # largest priority wins. Ties keep the historical stable sequence:
+        # the initial ready roots and each freshly released sibling batch
+        # enter the queue in ascending name order, so equal priorities emit
+        # exactly the old FIFO-Kahn order (identical to the all-zero
+        # default). Negative priorities are allowed and simply lose to
+        # larger ones.
         self._check_dependencies()
         deps = {k: set(v) for k, v in self.deps.items()}
         out = []
-        q = deque(sorted(k for k, v in deps.items() if not v))
-        while q:
-            n = q.popleft()
+        ready = []  # heap of (-priority, sequence, name)
+        sequence = 0
+        for name in sorted(n for n, d in deps.items() if not d):
+            heapq.heappush(
+                ready, (-self.priorities[name], sequence, name)
+            )
+            sequence += 1
+        while ready:
+            _, _, n = heapq.heappop(ready)
             out.append(n)
             for child in sorted(deps):
                 if n in deps[child]:
                     deps[child].remove(n)
                     if not deps[child]:
-                        q.append(child)
+                        heapq.heappush(
+                            ready,
+                            (-self.priorities[child], sequence, child),
+                        )
+                        sequence += 1
         if len(out) != len(deps):
             raise ValueError("cycle detected")
         return out
 
     def execution_state(self):
         """Return an independent snapshot of the most recent run, in
-        stable topological order.
+        priority topological order (the order() sequence).
 
         Each entry holds a status
         (pending/running/completed/failed/cancelled) plus the result or
@@ -160,7 +187,7 @@ class TaskGraph:
 
     def _resolve_run_order(self, targets):
         # Shared by run() and plan(): validate targets (when given), then
-        # validate the complete graph and derive the stable topological
+        # validate the complete graph and derive the priority topological
         # sequence this invocation covers. Returns a brand-new list on
         # every call and never touches task functions or self._state.
         selected = None
@@ -168,13 +195,13 @@ class TaskGraph:
             selected = self._normalize_targets(targets)
         # Always validate the complete graph, including unselected nodes:
         # a bad node outside the requested closure must not be silently
-        # accepted. order() also supplies the stable topological order whose
+        # accepted. order() also supplies the priority topological order whose
         # projection determines the covered sequence.
         order = self.order()
         if selected is None:
             return order
         # Close the selected targets over their transitive dependencies,
-        # then project the full stable topological order onto that closure.
+        # then project the full priority topological order onto that closure.
         closure = set()
         stack = list(selected)
         while stack:
@@ -213,11 +240,11 @@ class TaskGraph:
         return limits
 
     def plan(self, targets=None):
-        """Read-only preview of the stable task sequence run() would cover.
+        """Read-only preview of the priority task sequence run() would cover.
 
         targets=None (the default) covers the whole graph; an iterable of
         task names is deduplicated and closed over transitive dependencies,
-        and the result is the projection of the full stable topological
+        and the result is the projection of the full priority topological
         order onto that closure. Validation mirrors run(): bad targets
         raise TypeError/ValueError/KeyError, and missing dependencies or
         cycles anywhere in the graph raise KeyError/ValueError — all before
@@ -279,7 +306,7 @@ class TaskGraph:
         # whole graph; anything else must pass full input validation here,
         # before ordering and before replacing the previous snapshot.
         # _resolve_run_order validates targets, validates the complete
-        # graph (including unselected nodes) and returns the stable
+        # graph (including unselected nodes) and returns the priority
         # topological sequence this run covers — the exact sequence plan()
         # would preview for the same graph and targets.
         run_order = self._resolve_run_order(targets)
@@ -298,7 +325,7 @@ class TaskGraph:
         results = {}
         # "dead" nodes are failures plus everything that can no longer run
         # because it (transitively) depends on one. The run still advances
-        # strictly in stable topological order.
+        # strictly in priority topological order.
         dead = set()
         failures = []
         failure_errors = {}
@@ -310,7 +337,7 @@ class TaskGraph:
                 dead.add(name)
                 continue
             # Cooperative cancellation is consulted exactly once per task,
-            # in stable topological order, immediately before that task
+            # in priority topological order, immediately before that task
             # starts — never for unreachable nodes and never between
             # retries. A truthy result spends none of this task's retries;
             # a raising callback aborts as TaskControlError.
@@ -351,7 +378,7 @@ class TaskGraph:
                 results[name] = value
                 break
         if failures:
-            # Report the earliest failure in stable topological order; its
+            # Report the earliest failure in priority topological order; its
             # original and __cause__ are that node's final-attempt exception.
             first = failures[0]
             original = failure_errors[first]
@@ -376,7 +403,7 @@ class TaskGraph:
     @staticmethod
     def _mark_cancelled(run_order, state):
         # Flip every record that never started to "cancelled", walking
-        # the stable topological order so the returned names are stable
+        # the priority topological order so the returned names are stable
         # too. Completed/failed records (with results or final errors)
         # are left exactly as they settled.
         cancelled = []
@@ -395,7 +422,7 @@ class TaskGraph:
         direct dependencies all completed successfully — and waits for the
         whole batch to settle before the next round. Everything observable
         (input mappings, results key order, failure selection, state
-        records) follows the stable topological order, never the order in
+        records) follows the priority topological order, never the order in
         which concurrent tasks happen to finish.
         """
         position = {name: i for i, name in enumerate(run_order)}
@@ -428,7 +455,7 @@ class TaskGraph:
                 for name in pending:
                     # A direct dependency that failed or was skipped makes
                     # this node unreachable; it is never called and keeps
-                    # its pending placeholder. pending stays in stable
+                    # its pending placeholder. pending stays in priority
                     # topological order, so one pass propagates deadness
                     # through whole chains.
                     if self.deps[name] & dead:
@@ -438,7 +465,7 @@ class TaskGraph:
                 if not ready:
                     break  # only unreachable nodes remain
                 # Cooperative cancellation is consulted exactly once per
-                # batch, in stable topological order, after the previous
+                # batch, in priority topological order, after the previous
                 # batch has fully settled and before any node of this one
                 # starts — so a cancelled node never runs and never spends
                 # a retry. A truthy result still waits for nothing here
@@ -461,7 +488,7 @@ class TaskGraph:
                 for future in as_completed(futures):
                     outcomes[futures[future]] = future.result()
                 # The batch has fully settled before anything is recorded;
-                # outcomes are applied in stable topological order, never
+                # outcomes are applied in priority topological order, never
                 # in completion order.
                 for name in batch:
                     ok, value, exc = outcomes[name]
@@ -483,11 +510,11 @@ class TaskGraph:
                     # further node is started.
                     break
         if failures:
-            # Report the earliest failure in stable topological order; its
+            # Report the earliest failure in priority topological order; its
             # original and __cause__ are that node's final-attempt exception.
             first = min(failures, key=position.__getitem__)
             original = failure_errors[first]
             raise TaskExecutionError(first, original) from original
-        # Key order follows the stable topological order, not the order in
+        # Key order follows the priority topological order, not the order in
         # which concurrent tasks happened to finish.
         return {name: results[name] for name in run_order}
