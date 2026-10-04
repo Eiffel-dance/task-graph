@@ -451,6 +451,322 @@ class RetryTest(unittest.TestCase):
         self.assertEqual(g.execution_state(), {})
 
 
+class RetryLimitsTest(unittest.TestCase):
+    def test_entry_overrides_max_retries_for_that_task_only(self):
+        attempts = {"a": 0, "b": 0}
+
+        def make(name, failures):
+            def task(r):
+                attempts[name] += 1
+                if attempts[name] <= failures:
+                    raise RuntimeError("%s %d" % (name, attempts[name]))
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a", 2))  # needs 2 retries
+        g.add("b", make("b", 1), depends=["a"])  # needs 1 retry
+        # Uniform max_retries=0 would fail both; per-task limits fit exactly.
+        results = g.run(retry_limits={"a": 2, "b": 1})
+        self.assertEqual(results, {"a": "a", "b": "b"})
+        self.assertEqual(attempts, {"a": 3, "b": 2})
+
+    def test_tasks_without_entry_fall_back_to_max_retries(self):
+        attempts = {"a": 0, "b": 0}
+
+        def make(name):
+            def task(r):
+                attempts[name] += 1
+                if attempts[name] == 1:
+                    raise RuntimeError(name)
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a"))
+        g.add("b", make("b"), depends=["a"])
+        # Only "a" has an entry; "b" uses the uniform max_retries=1.
+        self.assertEqual(
+            g.run(max_retries=1, retry_limits={"a": 1}),
+            {"a": "a", "b": "b"},
+        )
+        self.assertEqual(attempts, {"a": 2, "b": 2})
+
+    def test_zero_entry_disables_retries_despite_max_retries(self):
+        calls = []
+
+        def flaky(r):
+            calls.append(1)
+            raise RuntimeError("always")
+
+        g = TaskGraph()
+        g.add("f", flaky)
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_retries=3, retry_limits={"f": 0})
+        self.assertEqual(ctx.exception.task_name, "f")
+        self.assertEqual(len(calls), 1)
+
+    def test_budgets_are_independent_per_task(self):
+        fails = {"a": 1, "b": 1}
+
+        def make(name):
+            def task(r):
+                if fails[name]:
+                    fails[name] -= 1
+                    raise RuntimeError(name)
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a"))
+        g.add("b", make("b"), depends=["a"])
+        # Each task fails once; a shared budget of 1 would not suffice.
+        self.assertEqual(
+            g.run(retry_limits={"a": 1, "b": 1}), {"a": "a", "b": "b"}
+        )
+
+    def test_exhaustion_reports_last_exception_and_skips_downstream(self):
+        attempts = {"n": 0}
+        calls_down = []
+
+        def flaky(r):
+            attempts["n"] += 1
+            raise ValueError("failure %d" % attempts["n"])
+
+        g = TaskGraph()
+        g.add("up", lambda r: 1)
+        g.add("flaky", flaky, depends=["up"])
+        g.add("down", lambda r: calls_down.append(1), depends=["flaky"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_retries=5, retry_limits={"flaky": 2})
+        err = ctx.exception
+        self.assertEqual(err.task_name, "flaky")
+        self.assertIs(err.__cause__, err.original)
+        self.assertEqual(str(err.original), "failure 3")
+        self.assertEqual(attempts["n"], 3)
+        self.assertEqual(calls_down, [])
+        state = g.execution_state()
+        self.assertEqual(state["up"]["status"], "completed")
+        self.assertEqual(state["flaky"]["status"], "failed")
+        self.assertEqual(
+            state["flaky"]["error"],
+            {"type": "ValueError", "message": "failure 3"},
+        )
+        self.assertEqual(state["down"]["status"], "pending")
+
+    def test_recovery_shows_only_final_result(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise RuntimeError("transient %d" % attempts["n"])
+            return "ok"
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        self.assertEqual(g.run(retry_limits={"flaky": 2}), {"flaky": "ok"})
+        state = g.execution_state()
+        self.assertEqual(
+            state["flaky"],
+            {"status": "completed", "result": "ok", "error": None},
+        )
+
+    def test_each_attempt_gets_fresh_input_mapping(self):
+        raw = []
+        seen = []
+
+        def flaky(r):
+            raw.append(r)
+            seen.append(dict(r))
+            r["polluted"] = True
+            if len(seen) == 1:
+                raise RuntimeError("once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("dep", lambda r: 1)
+        g.add("flaky", flaky, depends=["dep"])
+        self.assertEqual(g.run(retry_limits={"flaky": 1})["flaky"], "ok")
+        self.assertIsNot(raw[0], raw[1])
+        self.assertEqual(seen, [{"dep": 1}, {"dep": 1}])
+
+    def test_none_and_empty_mapping_keep_uniform_behavior(self):
+        for kwargs in ({}, {"retry_limits": None}, {"retry_limits": {}}):
+            calls = []
+
+            def flaky(r):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise RuntimeError("once")
+                return "ok"
+
+            g = TaskGraph()
+            g.add("f", flaky)
+            self.assertEqual(g.run(max_retries=1, **kwargs), {"f": "ok"})
+            self.assertEqual(len(calls), 2)
+
+    def test_retry_limits_is_keyword_only(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        with self.assertRaises(TypeError):
+            g.run(0, False, None, 1, {"a": 1})
+
+    def test_non_mapping_raises_typeerror_without_running(self):
+        for bad in (["a"], ("a",), "a", 1, 1.5, True, object()):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(retry_limits=bad)
+            self.assertIn("retry_limits", str(ctx.exception))
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_non_string_key_raises_typeerror(self):
+        for bad in ({1: 0}, {None: 0}, {b"a": 0}, {("a",): 0}, {True: 0}):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(TypeError):
+                g.run(retry_limits=bad)
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_non_integer_or_bool_value_raises_typeerror(self):
+        for bad in ({"ok": 1.5}, {"ok": "2"}, {"ok": None},
+                    {"ok": True}, {"ok": False}, {"ok": [1]}):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(TypeError):
+                g.run(retry_limits=bad)
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_negative_value_raises_valueerror(self):
+        for bad in ({"ok": -1}, {"ok": -100}):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(ValueError):
+                g.run(retry_limits=bad)
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_unknown_task_key_raises_keyerror(self):
+        for bad in ({"ghost": 1}, {"ok": 1, "ghost": 0}):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7)
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(KeyError):
+                g.run(retry_limits=bad)
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_invalid_retry_limits_with_empty_graph(self):
+        g = TaskGraph()
+        with self.assertRaises(TypeError):
+            g.run(retry_limits=["x"])
+        with self.assertRaises(KeyError):
+            g.run(retry_limits={"ghost": 1})
+        self.assertEqual(g.execution_state(), {})
+        # An empty mapping is valid and keeps the uniform behavior.
+        self.assertEqual(g.run(retry_limits={}), {})
+
+    def test_entries_outside_targets_closure_are_inert(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("x", flaky)
+        g.add("y", lambda r: r["x"] + "!", depends=["x"])
+        g.add("outside", lambda r: 99)
+        # The entry for the unselected task is legal but has no effect.
+        results = g.run(targets=["y"], retry_limits={"x": 1, "outside": 5})
+        self.assertEqual(results, {"x": "ok", "y": "ok!"})
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(set(g.execution_state()), {"x", "y"})
+
+    def test_works_with_continue_on_error(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            raise RuntimeError("fail %d" % attempts["n"])
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        g.add("ind", lambda r: "independent")
+        g.add("down", lambda r: None, depends=["flaky"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True, retry_limits={"flaky": 2})
+        self.assertEqual(ctx.exception.task_name, "flaky")
+        self.assertEqual(str(ctx.exception.original), "fail 3")
+        self.assertEqual(attempts["n"], 3)
+        state = g.execution_state()
+        self.assertEqual(state["ind"]["status"], "completed")
+        self.assertEqual(state["down"]["status"], "pending")
+        self.assertEqual(
+            state["flaky"]["error"],
+            {"type": "RuntimeError", "message": "fail 3"},
+        )
+
+    def test_works_with_concurrency(self):
+        attempts = {"a": 0, "b": 0}
+
+        def make(name, failures):
+            def task(r):
+                attempts[name] += 1
+                if attempts[name] <= failures:
+                    raise RuntimeError(name)
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a", 2))
+        g.add("b", make("b", 1))
+        g.add("c", lambda r: r["a"] + r["b"], depends=["a", "b"])
+        results = g.run(max_concurrency=2, retry_limits={"a": 2, "b": 1})
+        self.assertEqual(results, {"a": "a", "b": "b", "c": "ab"})
+        self.assertEqual(attempts, {"a": 3, "b": 2})
+        self.assertEqual(list(results), ["a", "b", "c"])
+
+    def test_concurrent_exhaustion_reports_earliest_failure(self):
+        g = TaskGraph()
+        g.add("a", lambda r: (_ for _ in ()).throw(ValueError("err a")))
+        g.add("b", lambda r: (_ for _ in ()).throw(RuntimeError("err b")))
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_concurrency=2, retry_limits={"a": 1, "b": 3})
+        self.assertEqual(ctx.exception.task_name, "a")
+        self.assertEqual(str(ctx.exception.original), "err a")
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "failed")
+        self.assertEqual(state["b"]["status"], "failed")
+
+    def test_plan_ignores_retry_limits_and_stays_read_only(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, depends=["a"])
+        self.assertEqual(g.plan(), ["a", "b"])
+        self.assertEqual(g.execution_state(), {})
+
+
 class ContinueOnErrorTest(unittest.TestCase):
     def test_independent_tasks_run_and_dependents_stay_pending(self):
         calls = []
