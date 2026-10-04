@@ -53,3 +53,18 @@ Tests: python3 -m unittest discover -s tests -v
 
 `plan` 的成功结果就是 `run` 的调度契约：对同一份未变更的图和同一组 `targets`，`plan` 返回的列表与实际 `run` 采用的稳定任务序列、返回映射键顺序以及 `execution_state()` 的记录顺序完全一致。该序列只由任务名称和依赖关系决定，不受注册先后、集合遍历、任务完成时序、`max_retries`、`continue_on_error` 或 `max_concurrency` 影响。`plan` 只负责预览，不执行任务，也不改变既有的失败与并发语义。
 
+## Cooperative cancellation
+
+`run(cancel_check=fn)` 增加一个仅限关键字传入的无参可调用对象（省略或传 `None` 时调用顺序、返回结果、异常类型、快照字段与失败传播规则完全不变，位置参数解释也不变）。传入非 `None` 的不可调用对象在排序、执行和替换最近一次 `execution_state()` 快照之前抛出 `TypeError`；回调是否可零参数调用不在此检查范围内——调用时的参数错误按回调自身异常处理（见下）。
+
+调度器在顺序模式下、每个**即将启动**的任务前（已因依赖失败而不可达的节点除外），按稳定拓扑序调用回调一次；并发模式下在每轮批次准备就绪后、提交任何任务前轮询一次。回调返回任意真值即记录取消请求：
+
+- 首次观察到取消后，不再启动任何尚未开始的任务，也不为它们消耗重试次数（取消前任务正在执行的重试预算继续自然收束）；并发模式下已提交的批次全部等待结束后才处理结果，结果仍按稳定拓扑序写入。
+- 本次运行固定抛出 `TaskCancelledError`，其 `task_names` 按稳定拓扑序列出闭包内所有未启动节点。
+- 快照中：已成功节点保留 `completed` 与结果；已失败节点保留 `failed` 及最后一次错误；其余未启动节点（含因依赖失败而不可达的节点）一律为 `cancelled`，`result` 与 `error` 均为 `None`。快照仍只覆盖本次 `targets` 闭包，闭包外节点不记录，快照独立性不变。
+- 仅当取消尚未被观察且任务按既有规则失败时，才抛 `TaskExecutionError`（快速失败或 `continue_on_error` 末尾报告最早失败的规则不变）；一旦回调已返回真值，即使快照中留有已记录失败，本次运行也固定抛 `TaskCancelledError`。
+
+回调自身抛出异常时，包装为 `TaskControlError`（`original` 与 `__cause__` 均指向回调异常），已完成/失败的状态保留，未启动节点标记为 `cancelled`；该异常不会替换图校验（`KeyError`/`ValueError`）、参数校验（`TypeError`/`ValueError`/`KeyError`）或任务自身的 `TaskExecutionError`。回调不接收参数，其返回值可为任意真值（用真值判断）。
+
+取消不改变图结构：重试预算、目标闭包、直接依赖输入、稳定键序与成功返回键序的既有语义均不受影响；后续不传入 `cancel_check` 的 `run` 仍全新执行。`plan` 不接受也不会调用该回调。
+

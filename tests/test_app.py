@@ -1,6 +1,11 @@
 import unittest
 import app
-from app import TaskGraph, TaskExecutionError
+from app import (
+    TaskGraph,
+    TaskExecutionError,
+    TaskCancelledError,
+    TaskControlError,
+)
 
 
 class SmokeTest(unittest.TestCase):
@@ -1670,6 +1675,483 @@ class ConcurrencyTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             g2.run(max_concurrency=2)
         self.assertIn("cycle detected", str(ctx.exception))
+
+
+class CancellationTest(unittest.TestCase):
+    def _diamond(self):
+        # order(): a, c, b, d, e (Kahn with the smallest ready name).
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", lambda r: calls.append("b") or r["a"] + 1, ["a"])
+        g.add("c", lambda r: calls.append("c") or 10)
+        g.add("d", lambda r: calls.append("d") or r["b"] + r["c"], ["b", "c"])
+        g.add("e", lambda r: calls.append("e") or r["d"] + 1, ["d"])
+        return g, calls
+
+    def test_omitted_or_none_leaves_everything_unchanged(self):
+        for kwargs in ({}, {"cancel_check": None}):
+            g, calls = self._diamond()
+            self.assertEqual(
+                g.run(**kwargs), {"a": 1, "c": 10, "b": 2, "d": 12, "e": 13}
+            )
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            state = g.execution_state()
+            self.assertTrue(
+                all(r["status"] == "completed" for r in state.values())
+            )
+
+    def test_plan_never_calls_callback(self):
+        checks = []
+        g, calls = self._diamond()
+        self.assertEqual(g.plan(), ["a", "c", "b", "d", "e"])
+        self.assertEqual(g.plan(["d"]), ["a", "c", "b", "d"])
+        self.assertEqual(checks, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(g.execution_state(), {})
+
+    def test_non_callable_rejected_before_ordering_and_execution(self):
+        for bad in (1, "x", object(), ["nope"], {"a": 1}, True):
+            g, calls = self._diamond()
+            g.run()
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(cancel_check=bad)
+            self.assertIn("cancel_check", str(ctx.exception))
+            self.assertEqual(calls, ["a", "c", "b", "d", "e"])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_cancel_check_is_keyword_only(self):
+        g, _ = self._diamond()
+        with self.assertRaises(TypeError):
+            g.run(0, False, None, 1, None, lambda: False)
+
+    def test_cancel_before_first_task_cancels_whole_graph(self):
+        g, calls = self._diamond()
+        polls = []
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(cancel_check=lambda: (polls.append(1), True)[1])
+        self.assertEqual(
+            ctx.exception.task_names, ["a", "c", "b", "d", "e"]
+        )
+        self.assertEqual(polls, [1])  # consulted exactly once
+        self.assertEqual(calls, [])  # no task started
+        state = g.execution_state()
+        self.assertEqual(list(state), ["a", "c", "b", "d", "e"])
+        for name in state:
+            self.assertEqual(
+                state[name],
+                {"status": "cancelled", "result": None, "error": None},
+            )
+
+    def test_cancel_mid_run_stops_before_next_stable_task(self):
+        g, calls = self._diamond()
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 3  # a and c run; b is next in order
+
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(cancel_check=check)
+        self.assertEqual(ctx.exception.task_names, ["b", "d", "e"])
+        self.assertEqual(calls, ["a", "c"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["a"]["result"], 1)
+        self.assertEqual(state["c"]["status"], "completed")
+        self.assertEqual(state["c"]["result"], 10)
+        for name in ("b", "d", "e"):
+            self.assertEqual(
+                state[name],
+                {"status": "cancelled", "result": None, "error": None},
+            )
+
+    def test_cancelled_task_spends_no_retries(self):
+        attempts = []
+
+        def flaky(r):
+            attempts.append(1)
+            raise RuntimeError("never reached")
+
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("flaky", flaky, ["a"])
+        polls = []
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(
+                max_retries=3,
+                cancel_check=lambda: (polls.append(1), len(polls) >= 2)[1],
+            )
+        self.assertEqual(ctx.exception.task_names, ["flaky"])
+        self.assertEqual(attempts, [])  # never called, none of 4 attempts
+        self.assertEqual(
+            g.execution_state()["flaky"]["status"], "cancelled"
+        )
+
+    def test_failure_before_cancel_is_observed_still_raises_execution(self):
+        # Cancellation has not yet been observed when the task fails:
+        # the failure follows the existing TaskExecutionError semantics.
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g = TaskGraph()
+        g.add("boom", boom)
+        g.add("later", lambda r: 1)
+        polls = []
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(cancel_check=lambda: (polls.append(1), False)[1])
+        self.assertEqual(ctx.exception.task_name, "boom")
+        state = g.execution_state()
+        self.assertEqual(state["boom"]["status"], "failed")
+        self.assertEqual(
+            state["boom"]["error"],
+            {"type": "RuntimeError", "message": "boom"},
+        )
+        # Callback was consulted once (before boom); fast failure stops
+        # the run, so later is never polled toward.
+        self.assertEqual(len(polls), 1)
+
+    def test_continue_on_error_records_failures_then_cancel_wins(self):
+        def boom(r):
+            raise RuntimeError("boom")
+
+        calls = []
+        g = TaskGraph()
+        # Stable order: boom, late, ok, down (down depends on boom).
+        g.add("boom", boom)
+        g.add("ok", lambda r: calls.append("ok") or 1)
+        g.add("down", lambda r: calls.append("down") or 1, ["boom"])
+        g.add("late", lambda r: calls.append("late") or 1)
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 3  # boom fails, late runs; cancel before ok
+
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(continue_on_error=True, cancel_check=check)
+        # ok never started; down was unreachable after boom's failure but
+        # is still an unstarted node, so it settles as cancelled too.
+        self.assertEqual(ctx.exception.task_names, ["ok", "down"])
+        self.assertEqual(calls, ["late"])
+        state = g.execution_state()
+        self.assertEqual(state["boom"]["status"], "failed")
+        self.assertIsNone(state["boom"]["result"])
+        self.assertEqual(
+            state["boom"]["error"],
+            {"type": "RuntimeError", "message": "boom"},
+        )
+        self.assertEqual(state["late"]["status"], "completed")
+        self.assertEqual(state["late"]["result"], 1)
+        self.assertEqual(
+            state["ok"], {"status": "cancelled", "result": None,
+                          "error": None}
+        )
+        self.assertEqual(
+            state["down"], {"status": "cancelled", "result": None,
+                            "error": None}
+        )
+
+    def test_cancel_inside_targets_closure_leaves_outside_unrecorded(self):
+        g, calls = self._diamond()
+        g.add("outside", lambda r: calls.append("outside") or 9)
+        polls = []
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(
+                targets=["e"],
+                cancel_check=lambda: (polls.append(1), len(polls) >= 2)[1],
+            )
+        # a ran, closure remainder (c, b, d, e) is cancelled; outside
+        # is neither executed nor recorded.
+        self.assertEqual(ctx.exception.task_names, ["c", "b", "d", "e"])
+        self.assertEqual(calls, ["a"])
+        state = g.execution_state()
+        self.assertEqual(set(state), {"a", "c", "b", "d", "e"})
+        self.assertNotIn("outside", state)
+        self.assertEqual(state["a"]["status"], "completed")
+
+    def test_callback_truthiness_accepts_any_true_value(self):
+        g, calls = self._diamond()
+        for truthy in (1, "yes", object(), [0], {"k": 0}):
+            g2, c2 = self._diamond()
+            with self.assertRaises(TaskCancelledError):
+                g2.run(cancel_check=lambda value=truthy: value)
+            self.assertEqual(c2, [])
+        # Explicit falsy values never cancel.
+        for falsy in (0, "", [], {}, False, None):
+            g2, c2 = self._diamond()
+            self.assertTrue(g2.run(cancel_check=lambda value=falsy: value))
+            self.assertEqual(c2, ["a", "c", "b", "d", "e"])
+
+    def test_callback_is_called_with_no_arguments(self):
+        g, _ = self._diamond()
+
+        def check():
+            return True
+
+        with self.assertRaises(TaskCancelledError):
+            g.run(cancel_check=check)
+        # A callable that does not accept a zero-argument call passes the
+        # callable() gate, then its invocation-time TypeError is a fault of
+        # the callback: it surfaces as TaskControlError, never a parameter
+        # error, with unstarted nodes settled as cancelled.
+        g2, calls2 = self._diamond()
+        with self.assertRaises(TaskControlError) as ctx:
+            g2.run(cancel_check=lambda missing: True)
+        self.assertIsInstance(ctx.exception.original, TypeError)
+        self.assertIs(ctx.exception.__cause__, ctx.exception.original)
+        self.assertEqual(calls2, [])
+        self.assertTrue(
+            all(
+                r["status"] == "cancelled"
+                for r in g2.execution_state().values()
+            )
+        )
+
+    def test_snapshot_independence_for_cancelled_records(self):
+        g, _ = self._diamond()
+        with self.assertRaises(TaskCancelledError):
+            g.run(cancel_check=lambda: True)
+        snapshot = g.execution_state()
+        snapshot["a"]["status"] = "completed"
+        snapshot["new"] = {}
+        again = g.execution_state()
+        self.assertEqual(again["a"]["status"], "cancelled")
+        self.assertNotIn("new", again)
+
+    def test_cancel_does_not_change_graph_and_next_run_is_fresh(self):
+        g, _ = self._diamond()
+        with self.assertRaises(TaskCancelledError):
+            g.run(cancel_check=lambda: True)
+        self.assertEqual(g.order(), ["a", "c", "b", "d", "e"])
+        # A subsequent run without cancel_check executes everything anew.
+        self.assertEqual(
+            g.run(), {"a": 1, "c": 10, "b": 2, "d": 12, "e": 13}
+        )
+        self.assertTrue(
+            all(
+                r["status"] == "completed"
+                for r in g.execution_state().values()
+            )
+        )
+
+    # --- concurrent scheduler ---------------------------------------
+
+    def test_concurrent_cancel_before_first_batch_cancels_all(self):
+        g, calls = self._diamond()
+        polls = []
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(
+                max_concurrency=2,
+                cancel_check=lambda: (polls.append(1), True)[1],
+            )
+        self.assertEqual(ctx.exception.task_names, ["a", "c", "b", "d", "e"])
+        self.assertEqual(polls, [1])  # once before the first batch
+        self.assertEqual(calls, [])
+        state = g.execution_state()
+        self.assertTrue(
+            all(r["status"] == "cancelled" for r in state.values())
+        )
+
+    def test_concurrent_cancel_between_batches_waits_for_submitted(self):
+        import time
+
+        calls = []
+
+        def slow_a(r):
+            calls.append("a")
+            time.sleep(0.1)
+            return 1
+
+        g = TaskGraph()
+        g.add("a", slow_a)
+        g.add("c", lambda r: calls.append("c") or 10)
+        g.add("b", lambda r: calls.append("b") or r["a"] + 1, ["a"])
+        g.add("d", lambda r: calls.append("d") or 1, ["b", "c"])
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 2  # first batch (a, c) runs; cancel rest
+
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(max_concurrency=2, cancel_check=check)
+        self.assertEqual(ctx.exception.task_names, ["b", "d"])
+        self.assertEqual(sorted(calls), ["a", "c"])  # whole batch settled
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["c"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "cancelled")
+        self.assertEqual(state["d"]["status"], "cancelled")
+
+    def test_concurrent_cancel_polled_once_per_batch(self):
+        g, _ = self._diamond()
+        polls = []
+        with self.assertRaises(TaskCancelledError):
+            g.run(
+                max_concurrency=2,
+                cancel_check=lambda: (polls.append(1), len(polls) >= 3)[1],
+            )
+        # Batches: [a, c] poll 1, [b] poll 2 (d needs b and c),
+        # [d] poll 3 cancels before d, leaving d and e unstarted.
+        self.assertEqual(polls, [1, 1, 1])
+
+    def test_concurrent_continue_on_error_then_cancel_between_batches(self):
+        # A failure settles in an early batch; with continue_on_error the
+        # scheduler keeps going until cancel_check requests a stop before
+        # a later batch. The failure stays in the snapshot, the cancelled
+        # exception names only nodes that never started.
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g = TaskGraph()
+        # Stable order: a, c, x, b, d. a fails; c succeeds; x is an
+        # independent later node; b depends on the failed a (dead), and
+        # d depends on b and c (dead through b).
+        g.add("a", boom)
+        g.add("c", lambda r: 10)
+        g.add("x", lambda r: 99)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.add("d", lambda r: 1, ["b", "c"])
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 2  # batch [a, c] runs; stop round 2
+
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(
+                max_concurrency=2,
+                continue_on_error=True,
+                cancel_check=check,
+            )
+        # x is the round-2 ready node that never starts; b and d were
+        # unreachable after a failed, but never started either.
+        self.assertEqual(ctx.exception.task_names, ["x", "b", "d"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "failed")
+        self.assertEqual(
+            state["a"]["error"],
+            {"type": "RuntimeError", "message": "boom"},
+        )
+        self.assertEqual(state["c"]["status"], "completed")
+        self.assertEqual(state["c"]["result"], 10)
+        for name in ("x", "b", "d"):
+            self.assertEqual(
+                state[name],
+                {"status": "cancelled", "result": None, "error": None},
+            )
+
+    def test_concurrent_failure_batch_settles_then_cancel_state(self):        # A failure observed before any cancellation still follows the
+        # existing TaskExecutionError path.
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g = TaskGraph()
+        g.add("a", boom)
+        g.add("c", lambda r: 10)
+        g.add("d", lambda r: 1, ["a", "c"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_concurrency=2, cancel_check=lambda: False)
+        self.assertEqual(ctx.exception.task_name, "a")
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "failed")
+        self.assertEqual(state["c"]["status"], "completed")
+        self.assertEqual(state["d"]["status"], "pending")
+
+    # --- callback raising -> TaskControlError ------------------------
+
+    def test_callback_exception_wraps_as_control_error(self):
+        g, calls = self._diamond()
+        original = RuntimeError("control exploded")
+        polls = []
+
+        def check():
+            polls.append(1)
+            raise original
+
+        with self.assertRaises(TaskControlError) as ctx:
+            g.run(cancel_check=check)
+        err = ctx.exception
+        self.assertIs(err.original, original)
+        self.assertIs(err.__cause__, original)
+        self.assertIn("RuntimeError", str(err))
+        self.assertEqual(polls, [1])
+        self.assertEqual(calls, [])
+        state = g.execution_state()
+        self.assertTrue(
+            all(r["status"] == "cancelled" for r in state.values())
+        )
+
+    def test_control_error_preserves_completed_and_failed(self):
+        def boom(r):
+            raise ValueError("task boom")
+
+        calls = []
+        g = TaskGraph()
+        # Stable order: a, bad, late, ok; down depends on bad.
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("bad", boom)
+        g.add("late", lambda r: calls.append("late") or 3)
+        g.add("ok", lambda r: calls.append("ok") or 2)
+        g.add("down", lambda r: calls.append("down") or 4, ["bad"])
+        polls = []
+
+        def check():
+            polls.append(1)
+            if len(polls) >= 4:
+                raise RuntimeError("control")  # before ok
+            return False
+
+        # a completes; bad fails (continue_on_error keeps it failed);
+        # late completes; down stays unreachable; the poll before ok
+        # raises -> TaskControlError, ok and down settle as cancelled.
+        with self.assertRaises(TaskControlError) as ctx:
+            g.run(continue_on_error=True, cancel_check=check)
+        self.assertIsInstance(ctx.exception.original, RuntimeError)
+        self.assertEqual(str(ctx.exception.original), "control")
+        self.assertIs(ctx.exception.__cause__, ctx.exception.original)
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["a"]["result"], 1)
+        self.assertEqual(state["bad"]["status"], "failed")
+        self.assertEqual(
+            state["bad"]["error"],
+            {"type": "ValueError", "message": "task boom"},
+        )
+        self.assertEqual(state["late"]["status"], "completed")
+        self.assertEqual(state["late"]["result"], 3)
+        for name in ("ok", "down"):
+            self.assertEqual(
+                state[name],
+                {"status": "cancelled", "result": None, "error": None},
+            )
+        self.assertEqual(calls, ["a", "late"])
+
+    def test_control_error_does_not_replace_validation_errors(self):
+        # Parameter validation (including cancel_check's own type) fires
+        # before the callback can ever run.
+        g, _ = self._diamond()
+        for bad in ("x", 1, object()):
+            with self.assertRaises(TypeError):
+                g.run(cancel_check=bad)
+        g.add("ghost", lambda r: None, ["missing"])
+        def check():
+            raise AssertionError("must not run")
+        with self.assertRaises(KeyError):
+            g.run(cancel_check=check)
+
+    def test_task_failure_is_not_wrapped_as_control_error(self):
+        def boom(r):
+            raise ValueError("task-side")
+
+        g = TaskGraph()
+        g.add("boom", boom)
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(cancel_check=lambda: False)
+        self.assertEqual(ctx.exception.task_name, "boom")
+        self.assertNotIsInstance(ctx.exception, TaskControlError)
 
 
 if __name__ == "__main__":
