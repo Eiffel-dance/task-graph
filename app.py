@@ -50,6 +50,26 @@ class TaskControlError(Exception):
         )
 
 
+class TaskResumeError(Exception):
+    """Raised when run(resume=True) cannot reuse the previous snapshot.
+
+    reason is one of:
+      - "no_previous_run": no run snapshot exists yet;
+      - "graph_changed": task names, dependencies or priorities differ
+        from those recorded when the snapshot was produced;
+      - "scope_changed": the normalized targets closure differs from
+        the scope the snapshot was produced for.
+
+    The rejection happens before any task is called and before the
+    snapshot is replaced, so the previous execution_state() survives
+    untouched.
+    """
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__("cannot resume run: %s" % reason)
+
+
 class TaskGraph:
     def __init__(self):
         self.tasks = {}
@@ -167,6 +187,10 @@ class TaskGraph:
         """
         snapshot = {}
         for name, record in self._state.items():
+            # The resume fingerprint is internal bookkeeping, never part
+            # of the public snapshot.
+            if name == "_resume":
+                continue
             entry = dict(record)
             if entry["error"] is not None:
                 entry["error"] = dict(entry["error"])
@@ -199,6 +223,26 @@ class TaskGraph:
         if unknown:
             raise KeyError("unknown target task %r" % unknown[0])
         return selected
+
+    def _snapshot_fingerprint(self):
+        # Recorded alongside every run snapshot so run(resume=True) can
+        # confirm that the graph the snapshot was produced against still
+        # has the same task names, the same direct dependency sets and the
+        # same priorities. It covers the whole (already validated) graph,
+        # not just the run closure: a newly added task changes task names
+        # even when a narrower targets closure would not touch it. Task
+        # functions are deliberately excluded — recovery works by fixing
+        # a failing task's function and resuming.
+        return {
+            name: (frozenset(self.deps[name]), self.priorities[name])
+            for name in self.tasks
+        }
+
+    def _fresh_state(self, run_order):
+        return {
+            name: {"status": "pending", "result": None, "error": None}
+            for name in run_order
+        }
 
     def _resolve_run_order(self, targets):
         # Shared by run() and plan(): validate targets (when given), then
@@ -271,7 +315,15 @@ class TaskGraph:
         return self._resolve_run_order(targets)
 
     def run(self, max_retries=0, continue_on_error=False, *, targets=None,
-            max_concurrency=1, retry_limits=None, cancel_check=None):
+            max_concurrency=1, retry_limits=None, cancel_check=None,
+            resume=False):
+        # resume is keyword-only, so the positional interpretation of the
+        # historical arguments never changes. False (the default) keeps the
+        # historical fresh-run behavior in every respect. It is strictly
+        # boolean; anything else is rejected like the other flags, before
+        # ordering, execution or replacement of the previous snapshot.
+        if not isinstance(resume, bool):
+            raise TypeError("resume must be a boolean")
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -325,19 +377,71 @@ class TaskGraph:
         # topological sequence this run covers — the exact sequence plan()
         # would preview for the same graph and targets.
         run_order = self._resolve_run_order(targets)
-        # Fresh snapshot per run covering exactly the executed closure:
-        # no records leak from previous runs or from unselected nodes.
-        state = {
-            name: {"status": "pending", "result": None, "error": None}
-            for name in run_order
+        reused = {}
+        if resume:
+            # Parameter and whole-graph validation have both passed by
+            # now; only then is the previous snapshot consulted. Every
+            # rejection leaves self._state (and therefore the snapshot
+            # visible via execution_state) exactly as it was and happens
+            # before any task function is called.
+            previous = self._state
+            previous_meta = previous.get("_resume") if previous else None
+            if not previous or previous_meta is None:
+                raise TaskResumeError("no_previous_run")
+            old_scope = previous_meta["scope"]
+            if set(previous) - {"_resume"} != set(old_scope):
+                # Defensive: a snapshot whose records do not match its
+                # own fingerprint cannot be confirmed.
+                raise TaskResumeError("no_previous_run")
+            old_fingerprint = previous_meta["fingerprint"]
+            # Confirm the whole graph against what the snapshot was
+            # produced from: a different set of task names (an added,
+            # removed or renamed task), a changed dependency set or a
+            # changed priority is graph_changed — even when the new
+            # targets closure would not include the differing node.
+            if set(old_fingerprint) != set(self.tasks):
+                raise TaskResumeError("graph_changed")
+            for name in old_fingerprint:
+                if old_fingerprint[name] != (
+                    frozenset(self.deps[name]), self.priorities[name]
+                ):
+                    raise TaskResumeError("graph_changed")
+            # Same graph: a different normalized targets closure is
+            # scope_changed.
+            if set(old_scope) != set(run_order):
+                raise TaskResumeError("scope_changed")
+            # Only completed results are reused; failed, pending and
+            # cancelled nodes are re-run with their old result/error
+            # cleared. Reused tasks are never called again.
+            reused = {
+                name: previous[name]["result"]
+                for name in run_order
+                if previous[name]["status"] == "completed"
+            }
+        # Every run snapshot — fresh or resumed — carries the fingerprint a
+        # later run(resume=True) confirms against. The metadata key is
+        # private: execution_state() never exposes it.
+        state = self._fresh_state(run_order)
+        if resume:
+            for name, value in reused.items():
+                state[name] = {
+                    "status": "completed", "result": value, "error": None,
+                }
+        state["_resume"] = {
+            "scope": list(run_order),
+            "fingerprint": self._snapshot_fingerprint(),
         }
         self._state = state
         if max_concurrency > 1:
             return self._run_concurrent(
                 run_order, state, max_retries, continue_on_error,
-                max_concurrency, limits, cancel_check,
+                max_concurrency, limits, cancel_check, reused=reused,
             )
-        results = {}
+        # Reused successes seed the result mapping: re-run tasks receive
+        # them through their direct-dependency inputs just like freshly
+        # computed values, but the reused tasks themselves are never
+        # called again.
+        results = dict(reused)
         # "dead" nodes are failures plus everything that can no longer run
         # because it (transitively) depends on one. The run still advances
         # strictly in priority topological order.
@@ -345,6 +449,11 @@ class TaskGraph:
         failures = []
         failure_errors = {}
         for name in run_order:
+            # A completed node carried over from the confirmed snapshot is
+            # reused verbatim: no cancel poll, no call, no retry, and it
+            # does not occupy a concurrency slot.
+            if name in reused:
+                continue
             # Any direct dependency that failed or was skipped marks this
             # node as unreachable; it is never called and keeps the empty
             # pending placeholder (result/error both None).
@@ -398,7 +507,9 @@ class TaskGraph:
             first = failures[0]
             original = failure_errors[first]
             raise TaskExecutionError(first, original) from original
-        return results
+        # Key order follows the plan order even though reused successes
+        # were seeded before the re-run nodes were visited.
+        return {name: results[name] for name in run_order}
 
     def _poll_cancel(self, cancel_check, run_order, state):
         # One polling point: the callback takes no arguments and any
@@ -430,7 +541,7 @@ class TaskGraph:
 
     def _run_concurrent(self, run_order, state, max_retries,
                         continue_on_error, max_concurrency, retry_limits,
-                        cancel_check=None):
+                        cancel_check=None, reused=None):
         """Batch scheduler used when max_concurrency > 1.
 
         Each round starts at most max_concurrency ready tasks — those whose
@@ -446,13 +557,18 @@ class TaskGraph:
         order in which concurrent tasks happen to finish.
         """
         position = {name: i for i, name in enumerate(run_order)}
-        results = {}
+        # Reused completed results are seeded exactly as if they had
+        # settled in an earlier batch: dependents become ready through
+        # them, but the reused nodes never enter pending, never take a
+        # slot and are never submitted to the pool.
+        reused = reused or {}
+        results = dict(reused)
         # "dead" nodes are failures plus everything that can no longer run
         # because it (transitively) depends on one.
         dead = set()
         failures = []
         failure_errors = {}
-        pending = list(run_order)
+        pending = [name for name in run_order if name not in reused]
 
         def attempt(name):
             # Retry budgets are per task — a retry_limits entry overrides
