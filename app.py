@@ -19,6 +19,48 @@ class TaskExecutionError(Exception):
         )
 
 
+class TaskCancelledError(Exception):
+    """Raised when a run observes a cancellation request from cancel_check.
+
+    Carries the names of the nodes that never started, in stable
+    topological order, as ``cancelled`` (``cancelled_tasks`` is an alias
+    for the same list). Nodes that already completed or failed keep
+    their records in the execution_state snapshot.
+    """
+
+    def __init__(self, cancelled):
+        self.cancelled = list(cancelled)
+        self.cancelled_tasks = self.cancelled
+        super().__init__(
+            "run cancelled; unstarted tasks: %s"
+            % ", ".join(repr(name) for name in self.cancelled)
+        )
+
+
+class TaskControlError(Exception):
+    """Raised when the cancel_check callback itself throws.
+
+    The callback's exception is available as ``original`` and as
+    __cause__; already completed or failed nodes keep their records and
+    every unstarted node is marked cancelled in the snapshot.
+    """
+
+    def __init__(self, original):
+        self.original = original
+        super().__init__(
+            "cancel_check failed: %s: %s"
+            % (type(original).__name__, original)
+        )
+
+
+def _cancel_unstarted(state):
+    # Every node that never started (still at its pending placeholder)
+    # becomes cancelled; completed and failed records are untouched.
+    for record in state.values():
+        if record["status"] == "pending":
+            record["status"] = "cancelled"
+
+
 class TaskGraph:
     def __init__(self):
         self.tasks = {}
@@ -87,9 +129,9 @@ class TaskGraph:
         """Return an independent snapshot of the most recent run, in
         stable topological order.
 
-        Each entry holds a status (pending/running/completed/failed)
-        plus the result or error details; mutating the returned object
-        does not affect the graph's internal state.
+        Each entry holds a status (pending/running/completed/failed/
+        cancelled) plus the result or error details; mutating the
+        returned object does not affect the graph's internal state.
         """
         snapshot = {}
         for name, record in self._state.items():
@@ -197,7 +239,7 @@ class TaskGraph:
         return self._resolve_run_order(targets)
 
     def run(self, max_retries=0, continue_on_error=False, *, targets=None,
-            max_concurrency=1, retry_limits=None):
+            max_concurrency=1, retry_limits=None, cancel_check=None):
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -234,6 +276,17 @@ class TaskGraph:
         limits = {}
         if retry_limits is not None:
             limits = self._normalize_retry_limits(retry_limits)
+        # cancel_check is keyword-only, so the positional interpretation
+        # of the historical arguments never changes. None (the default)
+        # keeps the run fully uninterrogated; anything else must be a
+        # zero-argument callable the scheduler polls for cancellation.
+        # Validation happens here — before ordering, execution and
+        # replacement of the previous snapshot — and never invokes the
+        # callback itself.
+        if cancel_check is not None and not callable(cancel_check):
+            raise TypeError(
+                "cancel_check must be a zero-argument callable or None"
+            )
         # targets is keyword-only so the positional interpretation of the
         # historical arguments never changes. None (the default) selects the
         # whole graph; anything else must pass full input validation here,
@@ -253,7 +306,7 @@ class TaskGraph:
         if max_concurrency > 1:
             return self._run_concurrent(
                 run_order, state, max_retries, continue_on_error,
-                max_concurrency, limits,
+                max_concurrency, limits, cancel_check,
             )
         results = {}
         # "dead" nodes are failures plus everything that can no longer run
@@ -262,6 +315,7 @@ class TaskGraph:
         dead = set()
         failures = []
         failure_errors = {}
+        cancelled = False
         for name in run_order:
             # Any direct dependency that failed or was skipped marks this
             # node as unreachable; it is never called and keeps the empty
@@ -269,6 +323,20 @@ class TaskGraph:
             if self.deps[name] & dead:
                 dead.add(name)
                 continue
+            if cancel_check is not None:
+                # One poll per task start, in stable topological order. A
+                # truthy answer records the cancellation request; a
+                # callback exception is a control error, never a task
+                # failure. Either way already-settled nodes keep their
+                # records and every unstarted node becomes cancelled.
+                try:
+                    stop = cancel_check()
+                except Exception as exc:
+                    _cancel_unstarted(state)
+                    raise TaskControlError(exc) from exc
+                if stop:
+                    cancelled = True
+                    break
             state[name]["status"] = "running"
             # Retry budgets are per task: a retry_limits entry overrides
             # max_retries for this task alone, and each task's budget is
@@ -301,6 +369,14 @@ class TaskGraph:
                 state[name]["result"] = value
                 results[name] = value
                 break
+        if cancelled:
+            # Once observed, cancellation is sticky: no further task
+            # starts, no retry budget is consumed for unstarted nodes,
+            # and TaskCancelledError wins over any recorded failure.
+            _cancel_unstarted(state)
+            raise TaskCancelledError(
+                [n for n in run_order if state[n]["status"] == "cancelled"]
+            )
         if failures:
             # Report the earliest failure in stable topological order; its
             # original and __cause__ are that node's final-attempt exception.
@@ -310,7 +386,8 @@ class TaskGraph:
         return results
 
     def _run_concurrent(self, run_order, state, max_retries,
-                        continue_on_error, max_concurrency, retry_limits):
+                        continue_on_error, max_concurrency, retry_limits,
+                        cancel_check):
         """Batch scheduler used when max_concurrency > 1.
 
         Each round starts at most max_concurrency ready tasks — those whose
@@ -328,6 +405,8 @@ class TaskGraph:
         failures = []
         failure_errors = {}
         pending = list(run_order)
+        cancelled = False
+        control_error = None
 
         def attempt(name):
             # Retry budgets are per task — a retry_limits entry overrides
@@ -359,6 +438,20 @@ class TaskGraph:
                         ready.append(name)
                 if not ready:
                     break  # only unreachable nodes remain
+                if cancel_check is not None:
+                    # One poll per batch, before the batch is prepared;
+                    # batches are formed in stable topological order, so
+                    # the polls follow that order too. A truthy answer
+                    # records the cancellation request; a callback
+                    # exception is a control error, never a task failure.
+                    try:
+                        stop = cancel_check()
+                    except Exception as exc:
+                        control_error = exc
+                        break
+                    if stop:
+                        cancelled = True
+                        break
                 batch = ready[:max_concurrency]
                 launched = set(batch)
                 pending = [
@@ -392,6 +485,19 @@ class TaskGraph:
                     # Fail fast: the settled batch is recorded above and no
                     # further node is started.
                     break
+        if control_error is not None:
+            # The callback failed: settled nodes keep their records and
+            # every unstarted node becomes cancelled.
+            _cancel_unstarted(state)
+            raise TaskControlError(control_error) from control_error
+        if cancelled:
+            # Once observed, cancellation is sticky: no further batch is
+            # prepared, no retry budget is consumed for unstarted nodes,
+            # and TaskCancelledError wins over any recorded failure.
+            _cancel_unstarted(state)
+            raise TaskCancelledError(
+                [n for n in run_order if state[n]["status"] == "cancelled"]
+            )
         if failures:
             # Report the earliest failure in stable topological order; its
             # original and __cause__ are that node's final-attempt exception.

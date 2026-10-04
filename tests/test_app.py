@@ -1672,5 +1672,342 @@ class ConcurrencyTest(unittest.TestCase):
         self.assertIn("cycle detected", str(ctx.exception))
 
 
+class CancellationTest(unittest.TestCase):
+    def _chain(self):
+        # order(): a, b, c, d
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", lambda r: calls.append("b") or r["a"] + 1, ["a"])
+        g.add("c", lambda r: calls.append("c") or r["b"] + 1, ["b"])
+        g.add("d", lambda r: calls.append("d") or r["c"] + 1, ["c"])
+        return g, calls
+
+    def test_cancel_check_is_keyword_only(self):
+        g, _ = self._chain()
+        with self.assertRaises(TypeError):
+            g.run(0, False, None, 1, None, lambda: False)
+
+    def test_non_callable_rejected_before_execution(self):
+        for bad in (0, 1, "x", b"x", 1.5, [lambda: True], object()):
+            g, calls = self._chain()
+            self.assertEqual(g.run()["d"], 4)
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(cancel_check=bad)
+            self.assertIn("cancel_check", str(ctx.exception))
+            self.assertEqual(calls, ["a", "b", "c", "d"])  # nothing ran
+            self.assertEqual(g.execution_state(), before)
+
+    def test_non_callable_rejected_with_empty_graph(self):
+        g = TaskGraph()
+        with self.assertRaises(TypeError):
+            g.run(cancel_check=42)
+        self.assertEqual(g.execution_state(), {})
+
+    def test_none_and_falsy_results_run_everything(self):
+        for check in (None, lambda: None, lambda: False, lambda: 0,
+                      lambda: "", lambda: []):
+            g, calls = self._chain()
+            kwargs = {} if check is None else {"cancel_check": check}
+            self.assertEqual(
+                g.run(**kwargs), {"a": 1, "b": 2, "c": 3, "d": 4}
+            )
+            self.assertEqual(calls, ["a", "b", "c", "d"])
+            self.assertTrue(
+                all(r["status"] == "completed"
+                    for r in g.execution_state().values())
+            )
+
+    def test_cancel_stops_unstarted_tasks_and_raises(self):
+        g, calls = self._chain()
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 3  # cancel right before c would start
+
+        with self.assertRaises(app.TaskCancelledError) as ctx:
+            g.run(cancel_check=check)
+        self.assertEqual(ctx.exception.cancelled, ["c", "d"])
+        self.assertEqual(calls, ["a", "b"])  # c and d never started
+        self.assertEqual(len(polls), 3)  # one poll per task start
+        state = g.execution_state()
+        self.assertEqual(list(state), ["a", "b", "c", "d"])
+        self.assertEqual(
+            state["a"], {"status": "completed", "result": 1, "error": None}
+        )
+        self.assertEqual(state["b"]["status"], "completed")
+        self.assertEqual(
+            state["c"], {"status": "cancelled", "result": None, "error": None}
+        )
+        self.assertEqual(
+            state["d"], {"status": "cancelled", "result": None, "error": None}
+        )
+
+    def test_cancelled_names_follow_stable_topological_order(self):
+        g = TaskGraph()
+        g.add("z", lambda r: 1)
+        g.add("m", lambda r: 2)
+        g.add("a", lambda r: 3)
+        with self.assertRaises(app.TaskCancelledError) as ctx:
+            g.run(cancel_check=lambda: True)  # cancel at the first poll
+        self.assertEqual(ctx.exception.cancelled, ["a", "m", "z"])
+        self.assertIs(ctx.exception.cancelled_tasks, ctx.exception.cancelled)
+        state = g.execution_state()
+        self.assertEqual(list(state), ["a", "m", "z"])
+        self.assertTrue(
+            all(r["status"] == "cancelled" for r in state.values())
+        )
+
+    def test_any_truthy_result_cancels(self):
+        for truthy in (True, 1, "stop", [1], object()):
+            g, calls = self._chain()
+            with self.assertRaises(app.TaskCancelledError):
+                g.run(cancel_check=lambda: truthy)
+            self.assertEqual(calls, [])
+
+    def test_no_retry_budget_consumed_for_unstarted_tasks(self):
+        attempts = []
+        g = TaskGraph()
+        g.add("first", lambda r: 1)
+        g.add("second", lambda r: attempts.append(1) or 2, ["first"])
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) == 2  # cancel right before second
+
+        with self.assertRaises(app.TaskCancelledError):
+            g.run(max_retries=3, cancel_check=check)
+        self.assertEqual(attempts, [])  # second never called at all
+
+    def test_failure_before_cancellation_still_raises_execution_error(self):
+        g = TaskGraph()
+
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g.add("a", boom)
+        g.add("b", lambda r: 2, ["a"])
+        # The first poll (before a) declines; a then fails fast before
+        # any further poll, so cancellation is never observed.
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(cancel_check=lambda: False)
+        self.assertEqual(ctx.exception.task_name, "a")
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "failed")
+        self.assertEqual(state["b"]["status"], "pending")  # never observed
+
+    def test_recorded_failure_survives_later_cancellation(self):
+        g = TaskGraph()
+
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g.add("a", boom)
+        g.add("b", lambda r: 2)
+        g.add("c", lambda r: 3)
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 3  # cancel before c starts
+
+        with self.assertRaises(app.TaskCancelledError) as ctx:
+            g.run(continue_on_error=True, cancel_check=check)
+        self.assertEqual(ctx.exception.cancelled, ["c"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "failed")  # failure kept
+        self.assertEqual(
+            state["a"]["error"], {"type": "RuntimeError", "message": "boom"}
+        )
+        self.assertEqual(state["b"]["status"], "completed")
+        self.assertEqual(state["c"]["status"], "cancelled")
+
+    def test_callback_exception_wrapped_as_control_error(self):
+        g, calls = self._chain()
+        blowup = ValueError("callback broke")
+        polls = []
+
+        def check():
+            polls.append(1)
+            if len(polls) == 3:
+                raise blowup
+            return False
+
+        with self.assertRaises(app.TaskControlError) as ctx:
+            g.run(cancel_check=check)
+        err = ctx.exception
+        self.assertIs(err.original, blowup)
+        self.assertIs(err.__cause__, blowup)
+        self.assertIn("callback broke", str(err))
+        self.assertEqual(calls, ["a", "b"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "completed")
+        self.assertEqual(state["c"]["status"], "cancelled")
+        self.assertEqual(state["d"]["status"], "cancelled")
+
+    def test_control_error_does_not_mask_validation_errors(self):
+        g, _ = self._chain()
+
+        def check():
+            raise RuntimeError("must not be consulted")
+
+        with self.assertRaises(ValueError):
+            g.run(max_retries=-1, cancel_check=check)
+        with self.assertRaises(TypeError):
+            g.run(continue_on_error=1, cancel_check=check)
+        with self.assertRaises(KeyError):
+            g.run(targets=["ghost"], cancel_check=check)
+        g.add("late", lambda r: None, ["missing"])
+        with self.assertRaises(KeyError):
+            g.run(cancel_check=check)
+        self.assertEqual(g.execution_state(), {})
+
+    def test_plan_never_polls_the_callback(self):
+        g, _ = self._chain()
+        polls = []
+
+        def check():
+            polls.append(1)
+            return True
+
+        self.assertEqual(g.plan(), ["a", "b", "c", "d"])
+        self.assertEqual(polls, [])
+        # A rejected run validates without ever invoking the callback.
+        with self.assertRaises(TypeError):
+            g.run(cancel_check=check, retry_limits=["x"])
+        self.assertEqual(polls, [])
+
+    def test_cancellation_does_not_mutate_graph_and_next_run_is_fresh(self):
+        g, calls = self._chain()
+        before_tasks = dict(g.tasks)
+        before_deps = {k: set(v) for k, v in g.deps.items()}
+        with self.assertRaises(app.TaskCancelledError):
+            g.run(cancel_check=lambda: True)
+        self.assertEqual(g.tasks, before_tasks)
+        self.assertEqual(g.deps, before_deps)
+        # A later run without cancel_check executes everything again.
+        self.assertEqual(g.run(), {"a": 1, "b": 2, "c": 3, "d": 4})
+        self.assertEqual(calls, ["a", "b", "c", "d"])
+        self.assertTrue(
+            all(r["status"] == "completed"
+                for r in g.execution_state().values())
+        )
+
+    def test_targets_closure_cancelled_names_and_snapshot(self):
+        g, calls = self._chain()
+        g.add("outside", lambda r: calls.append("outside") or 9)
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 2  # cancel before b starts
+
+        with self.assertRaises(app.TaskCancelledError) as ctx:
+            g.run(targets=["c"], cancel_check=check)
+        self.assertEqual(ctx.exception.cancelled, ["b", "c"])
+        self.assertEqual(calls, ["a"])  # outside never ran
+        state = g.execution_state()
+        self.assertEqual(set(state), {"a", "b", "c"})  # closure only
+        self.assertEqual(state["a"]["status"], "completed")
+        self.assertEqual(state["b"]["status"], "cancelled")
+        self.assertEqual(state["c"]["status"], "cancelled")
+
+    def test_concurrent_committed_batch_settles_then_cancels(self):
+        import threading
+        import time
+
+        started = []
+        lock = threading.Lock()
+
+        def make(name, delay):
+            def task(r):
+                with lock:
+                    started.append(name)
+                time.sleep(delay)
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a", 0.05))
+        g.add("b", make("b", 0.05))
+        g.add("c", make("c", 0.01), ["a", "b"])
+        g.add("d", make("d", 0.01), ["c"])
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 2  # cancel before the second batch
+
+        with self.assertRaises(app.TaskCancelledError) as ctx:
+            g.run(max_concurrency=2, cancel_check=check)
+        self.assertEqual(ctx.exception.cancelled, ["c", "d"])
+        # The committed batch (a, b) ran to completion; c never started.
+        self.assertEqual(sorted(started), ["a", "b"])
+        state = g.execution_state()
+        self.assertEqual(list(state), ["a", "b", "c", "d"])
+        self.assertEqual(
+            state["a"],
+            {"status": "completed", "result": "a", "error": None},
+        )
+        self.assertEqual(state["b"]["status"], "completed")
+        self.assertEqual(state["c"]["status"], "cancelled")
+        self.assertEqual(state["d"]["status"], "cancelled")
+
+    def test_concurrent_callback_exception_is_control_error(self):
+        g, _ = self._chain()
+        blowup = RuntimeError("poll exploded")
+
+        def check():
+            raise blowup
+
+        with self.assertRaises(app.TaskControlError) as ctx:
+            g.run(max_concurrency=2, cancel_check=check)
+        self.assertIs(ctx.exception.original, blowup)
+        self.assertIs(ctx.exception.__cause__, blowup)
+        state = g.execution_state()
+        self.assertTrue(
+            all(r["status"] == "cancelled" for r in state.values())
+        )
+
+    def test_concurrent_cancel_after_failure_keeps_failure(self):
+        g = TaskGraph()
+
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g.add("a", boom)
+        g.add("b", lambda r: 2)
+        g.add("c", lambda r: 3, ["b"])
+        polls = []
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 2  # cancel before the second batch
+
+        with self.assertRaises(app.TaskCancelledError) as ctx:
+            g.run(max_concurrency=2, continue_on_error=True,
+                  cancel_check=check)
+        self.assertEqual(ctx.exception.cancelled, ["c"])
+        state = g.execution_state()
+        self.assertEqual(state["a"]["status"], "failed")
+        self.assertEqual(state["b"]["status"], "completed")
+        self.assertEqual(state["c"]["status"], "cancelled")
+
+    def test_snapshot_of_cancelled_run_is_independent(self):
+        g, _ = self._chain()
+        with self.assertRaises(app.TaskCancelledError):
+            g.run(cancel_check=lambda: True)
+        snapshot = g.execution_state()
+        snapshot["a"]["status"] = "completed"
+        snapshot["new"] = {}
+        again = g.execution_state()
+        self.assertEqual(again["a"]["status"], "cancelled")
+        self.assertNotIn("new", again)
+
+
 if __name__ == "__main__":
     unittest.main()

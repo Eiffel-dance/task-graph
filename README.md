@@ -53,3 +53,11 @@ Tests: python3 -m unittest discover -s tests -v
 
 `plan` 的成功结果就是 `run` 的调度契约：对同一份未变更的图和同一组 `targets`，`plan` 返回的列表与实际 `run` 采用的稳定任务序列、返回映射键顺序以及 `execution_state()` 的记录顺序完全一致。该序列只由任务名称和依赖关系决定，不受注册先后、集合遍历、任务完成时序、`max_retries`、`continue_on_error` 或 `max_concurrency` 影响。`plan` 只负责预览，不执行任务，也不改变既有的失败与并发语义。
 
+## Cooperative cancellation
+
+`run(cancel_check=fn)` 增加一个仅限关键字传入的协作式取消回调（省略或传 `None` 时完全保持既有行为，位置参数解释不变）。`fn` 必须是无参可调用对象；其他值在排序、执行和替换最近一次 `execution_state()` 快照之前抛出 `TypeError`，校验本身不会调用该回调。调度器在顺序模式启动每个任务前、并发模式准备每个批次前，按稳定拓扑次序各调用一次；返回任意真值即记录取消请求，假值（`None`、`False`、`0`、`""` 等）继续正常调度。`plan` 从不调用该回调。
+
+首次观察到取消后，不再启动尚未开始的任务，也不为其消耗重试次数；已运行的任务及其重试预算自然收束，已提交的并发批次全部等待结束，结果仍按稳定拓扑顺序写入。快照中已成功节点保留 `completed` 与结果，已失败节点保留 `failed` 及最后一次错误，其余未启动节点改为 `cancelled`（`result` 与 `error` 均为 `None`）；快照仍独立且只覆盖目标闭包。回调一旦返回真值，本次运行固定抛出 `TaskCancelledError`，其 `cancelled`（别名 `cancelled_tasks`）按稳定拓扑顺序列出未启动节点名称，已记录的失败仍留在快照中；只有在取消尚未被观察时，任务失败才按既有规则抛出 `TaskExecutionError`。
+
+`cancel_check` 自身抛异常时包装为 `TaskControlError`（`original` 与 `__cause__` 指向回调异常），已完成或失败的状态保留，未启动节点标记 `cancelled`。该异常不会取代图校验、参数校验或任务本身的 `TaskExecutionError`：参数与图校验在调用回调之前完成，快速失败模式下任务失败立即抛出，都不会被控制异常掩盖。取消不修改图本身，后续不启用 `cancel_check` 的 `run` 仍全新执行。
+
