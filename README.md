@@ -94,6 +94,14 @@ Tests: python3 -m unittest discover -s tests -v
 
 恢复运行完全兼容 `max_concurrency`、`continue_on_error` 与 `cancel_check`：分批时每批只从未完成节点中挑选，复用的完成节点不占名额；快速失败、继续执行、`TaskExecutionError`（以优先级拓扑序最早失败节点为主体）、失败记录以及依赖失败节点保持 `pending` 的规则全部沿用；取消时复用节点保持 `completed`，`TaskCancelledError.task_names` 只按优先级拓扑序列出本次尚未启动的节点，其余状态沿用既有取消规则；回调自身抛异常仍包装为 `TaskControlError`。若成功恢复后闭包内节点已全部为 `completed`，则不调用任何任务，直接按原序返回全部结果并保留旧快照。`plan`、`order`、`add` 以及不传 `resume` 的 `run` 均不受影响；`execution_state()` 仍返回相互独立的快照副本。
 
+## Deterministic cycle diagnostics
+
+`TaskCycleError` 是 `app` 模块公开的环校验异常，继承 `ValueError`（既有按 `ValueError` 捕获的代码不受影响），并携带 `cycle` 属性：一个首尾相同的非空任务名列表，表示沿"任务 → 直接依赖"边走出的实际回路，自依赖为 `[name, name]`。列表只含回路上的节点，不夹带其他节点；异常文本稳定包含该路径（`cycle detected: a -> b -> a`），调用者也可直接读取 `cycle` 属性。
+
+`order()`、`plan()` 与 `run()` 在完成既有缺失依赖检查（`KeyError` 优先）后，只要**整张图**中存在环——包括 `targets` 闭包之外的环——都抛出 `TaskCycleError`。检测顺序固定：按任务名升序选起点，每个节点的直接依赖按名称升序深度优先搜索，首次回溯到当前路径上的节点时，从该节点首次出现处截取回路并以其收尾；同一图无论注册顺序、`targets` 容器类型、`max_concurrency`、重试或取消参数如何变化，报告的 `cycle` 与异常类型都完全一致。图中存在多个回路时，只报告该固定顺序下首个发现的回路。
+
+环错误只表示校验失败：任何任务函数都不会被调用，`run` 不会创建或替换 `execution_state()` 与 `execution_trace()`，先前快照与轨迹原样保留；`order()` 与 `plan()` 同样不改变图结构或状态。该校验覆盖顺序执行、并发调度以及 `resume=True` 的整图校验路径，且不影响既有参数校验优先级、`TaskExecutionError`、`TaskCancelledError`、`TaskControlError`、`TaskResumeError` 及其字段语义；非环图的拓扑顺序、结果键序、任务输入、重试与 `continue_on_error` 行为均不变。
+
 ## Execution trace audit
 
 `execution_trace()` 是只读的执行审计入口：返回最近一次**建立执行快照的 run** 的全新列表，解释该次 run 如何得到当前 `execution_state()`。此前没有任何运行快照时返回空列表（仅有 `plan`、`order`、`add` 不算运行；空图成功运行也会留下快照）。`plan`、`order`、`add` 以及参数校验或整图校验失败都不会生成或替换轨迹；只有真正建立快照的 `run`（包括失败、取消、回调异常及发生了重调度的 resume）才写入轨迹。每次调用都返回全新的深拷贝列表，调用方修改返回值（含嵌套的 `errors`/`error`）不影响后续查询。

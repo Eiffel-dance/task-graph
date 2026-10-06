@@ -68,6 +68,28 @@ class TaskResumeError(Exception):
         super().__init__("cannot resume run: %s" % reason)
 
 
+class TaskCycleError(ValueError):
+    """Raised when the graph contains a dependency cycle.
+
+    cycle is the actual loop walked along task -> direct-dependency
+    edges: a non-empty list of task names whose first and last entries
+    are the same node, with every adjacent pair a direct dependency
+    edge. A self-dependency reports [name, name]. The list contains
+    exactly the nodes of the loop, nothing else. Detection is
+    deterministic — start nodes are tried in ascending name order and
+    each node's direct dependencies are visited in ascending name
+    order — so the same graph always reports the same cycle regardless
+    of registration order, targets, max_concurrency, retry or cancel
+    arguments. The exception message always contains that path.
+    """
+
+    def __init__(self, cycle):
+        self.cycle = list(cycle)
+        super().__init__(
+            "cycle detected: %s" % " -> ".join(self.cycle)
+        )
+
+
 class TaskGraph:
     def __init__(self):
         self.tasks = {}
@@ -138,6 +160,42 @@ class TaskGraph:
                     "task %r depends on missing task %r" % (name, missing[0])
                 )
 
+    def _find_cycle(self):
+        # Deterministic depth-first search over task -> direct-dependency
+        # edges: start nodes are tried in ascending task-name order and
+        # each node's direct dependencies are visited in ascending name
+        # order. The first time the walk backtracks to a node already on
+        # the current path, the loop is cut from that node's first
+        # occurrence and closed with it, so the result names exactly the
+        # nodes of one actual cycle (a self-dependency yields
+        # [name, name]). Returns None for an acyclic graph. Only the
+        # first cycle found in this fixed order is reported, whatever
+        # else the graph contains.
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {name: WHITE for name in self.tasks}
+        path = []
+
+        def visit(name):
+            color[name] = GRAY
+            path.append(name)
+            for dep in sorted(self.deps[name]):
+                if color[dep] is GRAY:
+                    return path[path.index(dep):] + [dep]
+                if color[dep] is WHITE:
+                    cycle = visit(dep)
+                    if cycle is not None:
+                        return cycle
+            path.pop()
+            color[name] = BLACK
+            return None
+
+        for name in sorted(self.tasks):
+            if color[name] is WHITE:
+                cycle = visit(name)
+                if cycle is not None:
+                    return cycle
+        return None
+
     def order(self):
         # Priority-aware Kahn traversal. Nodes enter the ready queue once
         # their direct dependencies are all satisfied; the dependency-free
@@ -152,6 +210,15 @@ class TaskGraph:
         # only promote ready nodes ahead of lower-priority ones, and a
         # dependency is always emitted before its successors.
         self._check_dependencies()
+        # Cycle validation is part of graph validation, not of the
+        # traversal below: any cycle anywhere in the graph — including
+        # outside a requested targets closure — is reported before any
+        # ordering result, task call or state change, with the exact
+        # loop carried on the exception. Missing dependencies keep
+        # priority (KeyError above) over cycles.
+        cycle = self._find_cycle()
+        if cycle is not None:
+            raise TaskCycleError(cycle)
         deps = {k: set(v) for k, v in self.deps.items()}
         remaining = set(deps)
         ready = []  # (priority, intake_position, name)
@@ -184,7 +251,9 @@ class TaskGraph:
                         newly_ready.append(child)
             enqueue(newly_ready)
         if len(out) != len(deps):
-            raise ValueError("cycle detected")
+            # Unreachable: _find_cycle() above rejects every cyclic
+            # graph before the traversal starts.
+            raise TaskCycleError(self._find_cycle())
         return out
 
     def execution_state(self):
