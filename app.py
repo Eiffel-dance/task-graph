@@ -74,6 +74,12 @@ class TaskGraph:
         self.deps = defaultdict(set)
         self.priorities = {}
         self._state = {}
+        # Audit trail of the run that established the most recent
+        # execution_state snapshot: a priority-topological-ordered list of
+        # per-task records (task_name, status, attempts, errors, error).
+        # None until a run has established a snapshot; validation failures
+        # never touch it. Kept strictly in lockstep with self._state.
+        self._trace = None
         # Whole-graph structural fingerprint captured alongside every
         # snapshot: the set of (name, sorted dependencies, priority)
         # triples for every registered task. resume=True compares a
@@ -197,6 +203,59 @@ class TaskGraph:
                 entry["error"] = dict(entry["error"])
             snapshot[name] = entry
         return snapshot
+
+    def execution_trace(self):
+        """Return a fresh list auditing the run behind the latest snapshot.
+
+        Entries follow that run's priority topological order, one per task
+        in its executed closure, each with task_name, status
+        (completed/failed/blocked/cancelled/reused/pending), attempts (the
+        actual number of calls made this run), errors (type/message of every
+        failed attempt, in call order) and error (the final exception
+        summary, or None). Before any run has established a snapshot the
+        result is an empty list; plan(), order(), add() and failed
+        validation never create or replace a trace. The returned list is a
+        brand-new deep copy, so mutating it never affects later queries.
+        """
+        if self._trace is None:
+            return []
+        # The trace mapping is built in run order, so iterating its values
+        # yields the priority topological sequence.
+        return [self._copy_trace_record(record)
+                for record in self._trace.values()]
+
+    @staticmethod
+    def _copy_trace_record(record):
+        entry = {
+            "task_name": record["task_name"],
+            "status": record["status"],
+            "attempts": record["attempts"],
+            "errors": [dict(err) for err in record["errors"]],
+            "error": None if record["error"] is None else dict(
+                record["error"]
+            ),
+        }
+        return entry
+
+    @staticmethod
+    def _final_error(exc):
+        return {"type": type(exc).__name__, "message": str(exc)}
+
+    def _new_trace(self, run_order, reused):
+        # Build the audit records for a run that is establishing a fresh
+        # snapshot. Reused completed nodes are settled up front as "reused"
+        # with zero calls; every other node starts "pending" with zero
+        # attempts and is finalized according to how the run settles it.
+        trace = {}
+        for name in run_order:
+            trace[name] = {
+                "task_name": name,
+                "status": "reused" if name in reused else "pending",
+                "attempts": 0,
+                "errors": [],
+                "error": None,
+            }
+        return trace
 
     def _normalize_targets(self, targets):
         # Validate a targets argument completely before ordering, execution
@@ -393,11 +452,17 @@ class TaskGraph:
                 state[name] = {
                     "status": "pending", "result": None, "error": None
                 }
+        # The audit trail covers the same closure and is established
+        # together with the snapshot: reused nodes settle as "reused"
+        # without a single call, every other node starts "pending" and is
+        # finalized as the scheduler reaches (or skips) it.
+        trace = self._new_trace(run_order, reused)
         self._state = state
+        self._trace = trace
         self._state_fingerprint = self._fingerprint()
         if max_concurrency > 1:
             return self._run_concurrent(
-                run_order, state, max_retries, continue_on_error,
+                run_order, state, trace, max_retries, continue_on_error,
                 max_concurrency, limits, cancel_check, reused,
             )
         results = {
@@ -421,6 +486,7 @@ class TaskGraph:
             # pending placeholder (result/error both None).
             if self.deps[name] & dead:
                 dead.add(name)
+                trace[name]["status"] = "blocked"
                 continue
             # Cooperative cancellation is consulted exactly once per task
             # that (re)starts this run, in priority topological order,
@@ -429,30 +495,36 @@ class TaskGraph:
             # truthy result spends none of this task's retries; a raising
             # callback aborts as TaskControlError.
             if cancel_check is not None:
-                if self._poll_cancel(cancel_check, run_order, state):
-                    cancelled = self._mark_cancelled(run_order, state)
+                if self._poll_cancel(
+                    cancel_check, run_order, state, trace
+                ):
+                    cancelled = self._mark_cancelled(
+                        run_order, state, trace
+                    )
                     raise TaskCancelledError(cancelled)
             state[name]["status"] = "running"
             # Retry budgets are per task and counted afresh for this
             # recovery: a retry_limits entry overrides max_retries for
             # this task alone, and attempts spent in the previous run do
             # not carry over.
+            record = trace[name]
             budget = limits.get(name, max_retries)
             for attempt in range(budget + 1):
                 # Each attempt receives a brand-new mapping containing
                 # only its declared upstream values (reused or freshly
                 # computed); ordering keys keeps calls reproducible.
                 inputs = {d: results[d] for d in sorted(self.deps[name])}
+                record["attempts"] += 1
                 try:
                     value = self.tasks[name](inputs)
                 except Exception as exc:
+                    record["errors"].append(self._final_error(exc))
                     if attempt < budget:
                         continue  # retry the same task immediately
                     state[name]["status"] = "failed"
-                    state[name]["error"] = {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    }
+                    state[name]["error"] = self._final_error(exc)
+                    record["status"] = "failed"
+                    record["error"] = self._final_error(exc)
                     if not continue_on_error:
                         raise TaskExecutionError(name, exc) from exc
                     # Record the failure immediately and press on with
@@ -463,6 +535,7 @@ class TaskGraph:
                     break
                 state[name]["status"] = "completed"
                 state[name]["result"] = value
+                record["status"] = "completed"
                 results[name] = value
                 break
         if failures:
@@ -509,7 +582,7 @@ class TaskGraph:
             if self._state[name]["status"] == "completed"
         }
 
-    def _poll_cancel(self, cancel_check, run_order, state):
+    def _poll_cancel(self, cancel_check, run_order, state, trace=None):
         # One polling point: the callback takes no arguments and any
         # truthy value counts as a cancellation request. An exception
         # raised by the callback becomes a TaskControlError whose
@@ -520,24 +593,27 @@ class TaskGraph:
         try:
             requested = bool(cancel_check())
         except Exception as exc:
-            self._mark_cancelled(run_order, state)
+            self._mark_cancelled(run_order, state, trace)
             raise TaskControlError(exc) from exc
         return requested
 
     @staticmethod
-    def _mark_cancelled(run_order, state):
+    def _mark_cancelled(run_order, state, trace=None):
         # Flip every record that never started to "cancelled", walking
         # the priority topological order so the returned names are stable
         # too. Completed/failed records (with results or final errors)
-        # are left exactly as they settled.
+        # are left exactly as they settled. The audit trail is finalized
+        # the same way when one is being kept.
         cancelled = []
         for name in run_order:
             if state[name]["status"] == "pending":
                 state[name]["status"] = "cancelled"
                 cancelled.append(name)
+                if trace is not None:
+                    trace[name]["status"] = "cancelled"
         return cancelled
 
-    def _run_concurrent(self, run_order, state, max_retries,
+    def _run_concurrent(self, run_order, state, trace, max_retries,
                         continue_on_error, max_concurrency, retry_limits,
                         cancel_check=None, reused=frozenset()):
         """Batch scheduler used when max_concurrency > 1.
@@ -575,15 +651,22 @@ class TaskGraph:
             # max_retries for this task alone — and every attempt receives
             # a brand-new mapping of its direct dependencies, exactly as in
             # the sequential scheduler. results is only written by the
-            # scheduler thread between batches, so reads here are safe.
+            # scheduler thread between batches, so reads here are safe. The
+            # audit list is appended only by this task's own worker, so no
+            # synchronization is needed; it is read back on the scheduler
+            # thread after the whole batch has settled.
+            errors = []
             last = None
+            calls = 0
             for _ in range(retry_limits.get(name, max_retries) + 1):
                 inputs = {d: results[d] for d in sorted(self.deps[name])}
+                calls += 1
                 try:
-                    return True, self.tasks[name](inputs), None
+                    return True, self.tasks[name](inputs), None, calls, errors
                 except Exception as exc:
+                    errors.append(self._final_error(exc))
                     last = exc
-            return False, None, last
+            return False, None, last, calls, errors
 
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
             while pending:
@@ -596,6 +679,7 @@ class TaskGraph:
                     # through whole chains.
                     if self.deps[name] & dead:
                         dead.add(name)
+                        trace[name]["status"] = "blocked"
                     elif all(d in results for d in self.deps[name]):
                         ready.append(name)
                 if not ready:
@@ -612,8 +696,12 @@ class TaskGraph:
                 # already-submitted batch recorded, because rounds only
                 # advance once a whole batch has settled.
                 if cancel_check is not None:
-                    if self._poll_cancel(cancel_check, run_order, state):
-                        cancelled = self._mark_cancelled(run_order, state)
+                    if self._poll_cancel(
+                        cancel_check, run_order, state, trace
+                    ):
+                        cancelled = self._mark_cancelled(
+                            run_order, state, trace
+                        )
                         raise TaskCancelledError(cancelled)
                 batch = ready[:max_concurrency]
                 launched = set(batch)
@@ -628,19 +716,23 @@ class TaskGraph:
                     outcomes[futures[future]] = future.result()
                 # The batch has fully settled before anything is recorded;
                 # outcomes are applied in priority topological order, never
-                # in completion order.
+                # in completion order — including attempts and per-attempt
+                # errors in the audit trail.
                 for name in batch:
-                    ok, value, exc = outcomes[name]
+                    ok, value, exc, calls, errors = outcomes[name]
+                    record = trace[name]
+                    record["attempts"] = calls
+                    record["errors"] = errors
                     if ok:
                         state[name]["status"] = "completed"
                         state[name]["result"] = value
+                        record["status"] = "completed"
                         results[name] = value
                     else:
                         state[name]["status"] = "failed"
-                        state[name]["error"] = {
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                        }
+                        state[name]["error"] = self._final_error(exc)
+                        record["status"] = "failed"
+                        record["error"] = self._final_error(exc)
                         dead.add(name)
                         failures.append(name)
                         failure_errors[name] = exc

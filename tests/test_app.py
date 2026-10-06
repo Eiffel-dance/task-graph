@@ -2959,5 +2959,689 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(state["c"]["status"], "cancelled")
 
 
+class ExecutionTraceTest(unittest.TestCase):
+    RECORD_KEYS = {"task_name", "status", "attempts", "errors", "error"}
+
+    def _names(self, trace):
+        return [entry["task_name"] for entry in trace]
+
+    def _by_name(self, trace):
+        return {entry["task_name"]: entry for entry in trace}
+
+    # --- no snapshot / read-only behaviour ----------------------------
+
+    def test_empty_before_any_run_and_after_read_only_queries(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        self.assertEqual(g.execution_trace(), [])
+        g.order()
+        g.plan()
+        g.plan(["b"])
+        self.assertEqual(g.execution_state(), {})
+        self.assertEqual(g.execution_trace(), [])
+
+    def test_failed_first_ever_validation_leaves_trace_empty(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7)
+        with self.assertRaises(ValueError):
+            g.run(max_retries=-1)
+        with self.assertRaises(TypeError):
+            g.run(continue_on_error=1)
+        with self.assertRaises(KeyError):
+            g.run(targets=["ghost"])
+        with self.assertRaises(TypeError):
+            g.run(cancel_check=1)
+        self.assertEqual(g.execution_trace(), [])
+
+    def test_failed_add_does_not_create_or_replace_trace(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7)
+        self.assertEqual(g.run(), {"ok": 7})
+        before = g.execution_trace()
+        for call in (
+            lambda: g.add(None, lambda r: None),
+            lambda: g.add("", lambda r: None),
+            lambda: g.add("bad", None),
+            lambda: g.add("ok", lambda r: 1),
+        ):
+            with self.assertRaises((TypeError, ValueError)):
+                call()
+        self.assertEqual(g.execution_trace(), before)
+
+    def test_empty_graph_run_leaves_empty_trace(self):
+        g = TaskGraph()
+        self.assertEqual(g.run(), {})
+        self.assertEqual(g.execution_trace(), [])
+        self.assertEqual(g.run(resume=True), {})
+        self.assertEqual(g.execution_trace(), [])
+
+    # --- successful runs ----------------------------------------------
+
+    def test_successful_run_records_completed_with_one_attempt(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.add("c", lambda r: r["b"] + 1, ["b"])
+        self.assertEqual(g.run(), {"a": 1, "b": 2, "c": 3})
+        trace = g.execution_trace()
+        self.assertEqual(self._names(trace), ["a", "b", "c"])
+        self.assertEqual(
+            self._names(trace), list(g.execution_state())
+        )
+        for entry in trace:
+            self.assertEqual(set(entry), self.RECORD_KEYS)
+            self.assertEqual(entry["status"], "completed")
+            self.assertEqual(entry["attempts"], 1)
+            self.assertEqual(entry["errors"], [])
+            self.assertIsNone(entry["error"])
+        self.assertEqual(
+            [e["task_name"] for e in trace], ["a", "b", "c"]
+        )
+
+    def test_trace_order_follows_priority_topology(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.add("c", lambda r: 10, priority=5)
+        # c is promoted ahead of a as a ready root.
+        self.assertEqual(g.order(), ["c", "a", "b"])
+        g.run()
+        self.assertEqual(self._names(g.execution_trace()), ["c", "a", "b"])
+
+    def test_each_query_returns_a_fresh_independent_deep_copy(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                raise RuntimeError("once")
+            return "ok"
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        g.add("down", lambda r: 1, ["flaky"])
+        g.run(max_retries=1)
+        first = g.execution_trace()
+        self.assertIsNot(first, g.execution_trace())
+        first.append({"task_name": "injected"})
+        first[0]["status"] = "tampered"
+        first[0]["attempts"] = 99
+        first[0]["errors"].append({"type": "X", "message": "y"})
+        first[0]["errors"][0]["message"] = "tampered"
+        first[0]["error"] = {"type": "Z", "message": "z"}
+        again = g.execution_trace()
+        records = self._by_name(again)
+        self.assertEqual(self._names(again), ["flaky", "down"])
+        self.assertEqual(records["flaky"]["status"], "completed")
+        self.assertEqual(records["flaky"]["attempts"], 2)
+        self.assertEqual(
+            records["flaky"]["errors"],
+            [{"type": "RuntimeError", "message": "once"}],
+        )
+        self.assertIsNone(records["flaky"]["error"])
+        self.assertEqual(records["down"]["attempts"], 1)
+
+    # --- retries -------------------------------------------------------
+
+    def test_exhausted_retries_record_every_attempt_and_last_error(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            raise RuntimeError("failure %d" % attempts["n"])
+
+        g = TaskGraph()
+        g.add("up", lambda r: 1)
+        g.add("flaky", flaky, ["up"])
+        g.add("down", lambda r: 1, ["flaky"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_retries=1)
+        self.assertEqual(ctx.exception.task_name, "flaky")
+        trace = g.execution_trace()
+        records = self._by_name(trace)
+        self.assertEqual(self._names(trace), ["up", "flaky", "down"])
+        self.assertEqual(records["up"]["status"], "completed")
+        self.assertEqual(records["up"]["attempts"], 1)
+        self.assertEqual(records["flaky"]["status"], "failed")
+        self.assertEqual(records["flaky"]["attempts"], 2)
+        self.assertEqual(
+            records["flaky"]["errors"],
+            [
+                {"type": "RuntimeError", "message": "failure 1"},
+                {"type": "RuntimeError", "message": "failure 2"},
+            ],
+        )
+        self.assertEqual(
+            records["flaky"]["error"],
+            {"type": "RuntimeError", "message": "failure 2"},
+        )
+        # Fast failure: down was never scheduled.
+        self.assertEqual(records["down"]["status"], "pending")
+        self.assertEqual(records["down"]["attempts"], 0)
+        self.assertEqual(records["down"]["errors"], [])
+        self.assertIsNone(records["down"]["error"])
+
+    def test_successful_retry_keeps_failed_attempts_but_no_final_error(self):
+        attempts = {"n": 0}
+
+        def flaky(r):
+            attempts["n"] += 1
+            if attempts["n"] <= 2:
+                raise ValueError("bad %d" % attempts["n"])
+            return "ok"
+
+        g = TaskGraph()
+        g.add("flaky", flaky)
+        g.run(retry_limits={"flaky": 2})
+        record = self._by_name(g.execution_trace())["flaky"]
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["attempts"], 3)
+        self.assertEqual(
+            record["errors"],
+            [
+                {"type": "ValueError", "message": "bad 1"},
+                {"type": "ValueError", "message": "bad 2"},
+            ],
+        )
+        self.assertIsNone(record["error"])
+
+    def test_retry_limits_drive_attempt_counts_per_task(self):
+        calls = []
+
+        def make(name, failures):
+            def task(r):
+                calls.append(name)
+                if calls.count(name) <= failures:
+                    raise RuntimeError(name)
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a", 2))
+        g.add("b", make("b", 1), ["a"])
+        self.assertEqual(
+            g.run(max_retries=1, retry_limits={"a": 2}),
+            {"a": "a", "b": "b"},
+        )
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["attempts"], 3)
+        self.assertEqual(len(records["a"]["errors"]), 2)
+        self.assertEqual(records["b"]["attempts"], 2)
+        self.assertEqual(len(records["b"]["errors"]), 1)
+
+    # --- failures and blocked nodes -----------------------------------
+
+    def test_continue_on_error_marks_dependents_blocked(self):
+        def boom(r):
+            raise RuntimeError("boom b")
+
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", boom, ["a"])
+        g.add("c", lambda r: calls.append("c"), ["b"])
+        g.add("d", lambda r: calls.append("d"), ["b"])
+        g.add("e", lambda r: calls.append("e") or 5)
+        g.add("f", lambda r: calls.append("f") or r["e"] + 1, ["e"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(continue_on_error=True)
+        self.assertEqual(ctx.exception.task_name, "b")
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "completed")
+        self.assertEqual(records["a"]["attempts"], 1)
+        self.assertEqual(records["b"]["status"], "failed")
+        self.assertEqual(records["b"]["attempts"], 1)
+        self.assertEqual(
+            records["b"]["error"],
+            {"type": "RuntimeError", "message": "boom b"},
+        )
+        self.assertEqual(
+            records["b"]["errors"],
+            [{"type": "RuntimeError", "message": "boom b"}],
+        )
+        for blocked in ("c", "d"):
+            self.assertEqual(records[blocked]["status"], "blocked")
+            self.assertEqual(records[blocked]["attempts"], 0)
+            self.assertEqual(records[blocked]["errors"], [])
+            self.assertIsNone(records[blocked]["error"])
+        self.assertEqual(records["e"]["status"], "completed")
+        self.assertEqual(records["f"]["status"], "completed")
+
+    def test_transitive_dependents_are_blocked(self):
+        def fail(r):
+            raise ValueError("up")
+
+        g = TaskGraph()
+        g.add("a", fail)
+        g.add("b", lambda r: 1, ["a"])
+        g.add("c", lambda r: 1, ["b"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(continue_on_error=True)
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "failed")
+        self.assertEqual(records["b"]["status"], "blocked")
+        self.assertEqual(records["c"]["status"], "blocked")
+
+    # --- cancellation / control errors --------------------------------
+
+    def test_cancel_before_start_marks_all_cancelled_with_zero_attempts(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: 2, ["a"])
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(cancel_check=lambda: True)
+        self.assertEqual(ctx.exception.task_names, ["a", "b"])
+        trace = g.execution_trace()
+        self.assertEqual(self._names(trace), ["a", "b"])
+        for entry in trace:
+            self.assertEqual(entry["status"], "cancelled")
+            self.assertEqual(entry["attempts"], 0)
+            self.assertEqual(entry["errors"], [])
+            self.assertIsNone(entry["error"])
+
+    def test_cancel_mid_run_keeps_started_records(self):
+        polls = []
+
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: 2, ["a"])
+        g.add("c", lambda r: 3, ["b"])
+
+        def check():
+            polls.append(1)
+            return len(polls) >= 2  # a runs; b and c cancel
+
+        with self.assertRaises(TaskCancelledError) as ctx:
+            g.run(cancel_check=check)
+        self.assertEqual(ctx.exception.task_names, ["b", "c"])
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "completed")
+        self.assertEqual(records["a"]["attempts"], 1)
+        for name in ("b", "c"):
+            self.assertEqual(records[name]["status"], "cancelled")
+            self.assertEqual(records[name]["attempts"], 0)
+
+    def test_cancelled_task_spends_no_attempts(self):
+        def flaky(r):
+            raise RuntimeError("never")
+
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("flaky", flaky, ["a"])
+        polls = []
+        with self.assertRaises(TaskCancelledError):
+            g.run(
+                max_retries=3,
+                cancel_check=lambda: (polls.append(1), len(polls) >= 2)[1],
+            )
+        record = self._by_name(g.execution_trace())["flaky"]
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["attempts"], 0)
+        self.assertEqual(record["errors"], [])
+
+    def test_control_error_keeps_started_records_cancels_rest(self):
+        def boom(r):
+            raise ValueError("task boom")
+
+        calls = []
+        g = TaskGraph()
+        # Stable order: a, bad, late, ok; down depends on bad.
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("bad", boom)
+        g.add("late", lambda r: calls.append("late") or 3)
+        g.add("ok", lambda r: calls.append("ok") or 2)
+        g.add("down", lambda r: calls.append("down") or 4, ["bad"])
+        polls = []
+
+        def check():
+            polls.append(1)
+            if len(polls) >= 4:
+                raise RuntimeError("control")
+            return False
+
+        with self.assertRaises(TaskControlError):
+            g.run(continue_on_error=True, cancel_check=check)
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "completed")
+        self.assertEqual(records["bad"]["status"], "failed")
+        self.assertEqual(records["bad"]["attempts"], 1)
+        self.assertEqual(
+            records["bad"]["error"],
+            {"type": "ValueError", "message": "task boom"},
+        )
+        self.assertEqual(records["late"]["status"], "completed")
+        for name in ("ok", "down"):
+            self.assertEqual(records[name]["status"], "cancelled")
+            self.assertEqual(records[name]["attempts"], 0)
+            self.assertEqual(records[name]["errors"], [])
+            self.assertIsNone(records[name]["error"])
+
+    # --- resume --------------------------------------------------------
+
+    def _resume_chain(self, fail=None):
+        # Priority topological order: a, d, b, c.
+        calls = []
+        remaining = dict(fail or {})
+
+        def make(name):
+            def task(r):
+                calls.append(name)
+                if remaining.get(name, 0) > 0:
+                    remaining[name] -= 1
+                    raise RuntimeError(name + " boom")
+                return name
+            return task
+
+        g = TaskGraph()
+        g.add("a", make("a"))
+        g.add("d", make("d"))
+        g.add("b", make("b"), ["a"])
+        g.add("c", make("c"), ["b"])
+        return g, calls, make
+
+    def test_resume_marks_completed_reused_and_reruns_rest(self):
+        g, calls, make = self._resume_chain(fail={"b": 1})
+        with self.assertRaises(TaskExecutionError):
+            g.run(continue_on_error=True)
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "completed")
+        self.assertEqual(records["d"]["status"], "completed")
+        self.assertEqual(records["b"]["status"], "failed")
+        self.assertEqual(records["b"]["attempts"], 1)
+        self.assertEqual(records["c"]["status"], "blocked")
+        g.tasks["b"] = make("b")
+        g.run(resume=True)
+        trace = g.execution_trace()
+        self.assertEqual(self._names(trace), ["a", "d", "b", "c"])
+        records = self._by_name(trace)
+        for name in ("a", "d"):
+            self.assertEqual(records[name]["status"], "reused")
+            self.assertEqual(records[name]["attempts"], 0)
+            self.assertEqual(records[name]["errors"], [])
+            self.assertIsNone(records[name]["error"])
+        self.assertEqual(records["b"]["status"], "completed")
+        self.assertEqual(records["b"]["attempts"], 1)
+        self.assertEqual(records["c"]["status"], "completed")
+        self.assertEqual(records["c"]["attempts"], 1)
+
+    def test_resume_fast_failure_keeps_downstream_pending(self):
+        g, calls, make = self._resume_chain(fail={"b": 100})
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        with self.assertRaises(TaskExecutionError):
+            g.run(resume=True)
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "reused")
+        self.assertEqual(records["d"]["status"], "reused")
+        self.assertEqual(records["b"]["status"], "failed")
+        self.assertEqual(records["b"]["attempts"], 1)
+        self.assertEqual(len(records["b"]["errors"]), 1)
+        self.assertEqual(
+            records["b"]["error"],
+            {"type": "RuntimeError", "message": "b boom"},
+        )
+        self.assertEqual(records["c"]["status"], "pending")
+
+    def test_resume_all_completed_keeps_the_established_snapshot_trace(self):
+        # An all-completed resume calls nothing and retains the previous
+        # snapshot (it establishes no new one), so the audit trail stays
+        # that of the run that actually established the snapshot.
+        g, calls, make = self._resume_chain()
+        g.run()
+        before = g.execution_trace()
+        g.run(resume=True)
+        self.assertEqual(g.execution_trace(), before)
+        g.run(resume=True)
+        self.assertEqual(g.execution_trace(), before)
+        trace = g.execution_trace()
+        self.assertEqual(self._names(trace), ["a", "d", "b", "c"])
+        for entry in trace:
+            self.assertEqual(entry["status"], "completed")
+            self.assertEqual(entry["attempts"], 1)
+            self.assertEqual(entry["errors"], [])
+            self.assertIsNone(entry["error"])
+
+    def test_resume_rejection_preserves_previous_trace(self):
+        g, calls, make = self._resume_chain()
+        g.run()
+        before = g.execution_trace()
+        g.add("new", lambda r: 1)
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "graph_changed")
+        self.assertEqual(g.execution_trace(), before)
+
+    # --- targets -------------------------------------------------------
+
+    def test_trace_covers_only_targets_closure(self):
+        calls = []
+
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("b", boom, ["a"])
+        g.add("c", lambda r: calls.append("c"), ["b"])
+        g.add("outside", lambda r: calls.append("outside") or 9)
+        with self.assertRaises(TaskExecutionError):
+            g.run(targets=["c"])
+        trace = g.execution_trace()
+        self.assertEqual(self._names(trace), ["a", "b", "c"])
+        records = self._by_name(trace)
+        self.assertEqual(records["a"]["status"], "completed")
+        self.assertEqual(records["b"]["status"], "failed")
+        self.assertEqual(records["c"]["status"], "pending")
+        self.assertNotIn("outside", records)
+
+    # --- validation never replaces the last trace ---------------------
+
+    def test_failed_validation_and_graph_checks_keep_last_trace(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7)
+        g.add("later", lambda r: 1, ["ok"])
+        self.assertEqual(g.run(), {"ok": 7, "later": 1})
+        before = g.execution_trace()
+        self.assertEqual(len(before), 2)
+        with self.assertRaises(ValueError):
+            g.run(max_retries=-1)
+        with self.assertRaises(TypeError):
+            g.run(continue_on_error=1)
+        with self.assertRaises(TypeError):
+            g.run(resume=1)
+        with self.assertRaises(TypeError):
+            g.run(max_concurrency=True)
+        with self.assertRaises(TypeError):
+            g.run(cancel_check=1)
+        with self.assertRaises(TypeError):
+            g.run(retry_limits=["ok"])
+        with self.assertRaises(KeyError):
+            g.run(retry_limits={"ghost": 1})
+        with self.assertRaises(KeyError):
+            g.run(targets=["ghost"])
+        with self.assertRaises(TypeError):
+            g.plan(7)
+        g.add("late", lambda r: None, ["missing"])
+        with self.assertRaises(KeyError):
+            g.run()
+        with self.assertRaises(KeyError):
+            g.plan()
+        self.assertEqual(g.execution_trace(), before)
+        # The surviving trace still audits the successful run exactly.
+        again = self._by_name(g.execution_trace())
+        self.assertEqual(again["ok"]["status"], "completed")
+        self.assertEqual(again["later"]["status"], "completed")
+
+    def test_later_successful_run_replaces_trace(self):
+        g = TaskGraph()
+
+        def boom(r):
+            raise RuntimeError("boom")
+
+        g.add("boom", boom)
+        with self.assertRaises(TaskExecutionError):
+            g.run()
+        self.assertEqual(
+            self._by_name(g.execution_trace())["boom"]["status"], "failed"
+        )
+        g.tasks["boom"] = lambda r: 1
+        g.run()
+        record = self._by_name(g.execution_trace())["boom"]
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["attempts"], 1)
+        self.assertEqual(record["errors"], [])
+        self.assertIsNone(record["error"])
+
+    # --- concurrency ---------------------------------------------------
+
+    def test_concurrent_trace_order_ignores_completion_order(self):
+        import time
+
+        def slow(r):
+            time.sleep(0.1)
+            return "slow"
+
+        g = TaskGraph()
+        g.add("a", slow)
+        g.add("b", lambda r: "fast")
+        g.add("c", lambda r: r["a"] + r["b"], ["a", "b"])
+        g.run(max_concurrency=2)
+        trace = g.execution_trace()
+        self.assertEqual(self._names(trace), ["a", "b", "c"])
+        for entry in trace:
+            self.assertEqual(entry["status"], "completed")
+            self.assertEqual(entry["attempts"], 1)
+            self.assertEqual(entry["errors"], [])
+            self.assertIsNone(entry["error"])
+
+    def test_concurrent_retries_merge_by_task_not_completion_order(self):
+        import time
+
+        def make_flaky(failures):
+            state = {"left": failures}
+
+            def task(r):
+                if state["left"] > 0:
+                    state["left"] -= 1
+                    raise RuntimeError("left %d" % state["left"])
+                time.sleep(0.1)  # success lands late despite more attempts
+                return "ok"
+            return task
+
+        g = TaskGraph()
+        g.add("a", make_flaky(2))
+        g.add("b", make_flaky(0))
+        g.run(max_concurrency=2, max_retries=2)
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(set(records), {"a", "b"})
+        self.assertEqual(records["a"]["status"], "completed")
+        self.assertEqual(records["a"]["attempts"], 3)
+        self.assertEqual(
+            records["a"]["errors"],
+            [
+                {"type": "RuntimeError", "message": "left 1"},
+                {"type": "RuntimeError", "message": "left 0"},
+            ],
+        )
+        self.assertIsNone(records["a"]["error"])
+        self.assertEqual(records["b"]["attempts"], 1)
+        self.assertEqual(records["b"]["errors"], [])
+
+    def test_concurrent_fast_failure_marks_failed_and_pending(self):
+        import time
+
+        def boom(r):
+            raise RuntimeError("batch boom")
+
+        def slow(r):
+            time.sleep(0.1)
+            return "slow"
+
+        g = TaskGraph()
+        g.add("boom", boom)
+        g.add("slow", slow)
+        g.add("later", lambda r: 1, ["slow"])
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_concurrency=2)
+        self.assertEqual(ctx.exception.task_name, "boom")
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["boom"]["status"], "failed")
+        self.assertEqual(records["boom"]["attempts"], 1)
+        self.assertEqual(
+            records["boom"]["error"],
+            {"type": "RuntimeError", "message": "batch boom"},
+        )
+        self.assertEqual(records["slow"]["status"], "completed")
+        self.assertEqual(records["later"]["status"], "pending")
+        self.assertEqual(records["later"]["attempts"], 0)
+
+    def test_concurrent_continue_on_error_marks_dependents_blocked(self):
+        def boom(r):
+            raise RuntimeError("boom b")
+
+        g = TaskGraph()
+        g.add("boom", boom)
+        g.add("ind", lambda r: 2)
+        g.add("down", lambda r: 1, ["boom"])
+        g.add("join", lambda r: 1, ["boom", "ind"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(max_concurrency=2, continue_on_error=True)
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["boom"]["status"], "failed")
+        self.assertEqual(records["ind"]["status"], "completed")
+        self.assertEqual(records["down"]["status"], "blocked")
+        self.assertEqual(records["join"]["status"], "blocked")
+
+    def test_concurrent_cancel_keeps_settled_batch_and_cancels_rest(self):
+        import time
+
+        calls = []
+
+        def slow_a(r):
+            calls.append("a")
+            time.sleep(0.1)
+            return 1
+
+        g = TaskGraph()
+        g.add("a", slow_a)
+        g.add("c", lambda r: calls.append("c") or 10)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.add("d", lambda r: 1, ["b", "c"])
+        polls = []
+        with self.assertRaises(TaskCancelledError):
+            g.run(
+                max_concurrency=2,
+                cancel_check=lambda: (polls.append(1),
+                                      len(polls) >= 2)[1],
+            )
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "completed")
+        self.assertEqual(records["a"]["attempts"], 1)
+        self.assertEqual(records["c"]["status"], "completed")
+        for name in ("b", "d"):
+            self.assertEqual(records[name]["status"], "cancelled")
+            self.assertEqual(records[name]["attempts"], 0)
+            self.assertEqual(records[name]["errors"], [])
+            self.assertIsNone(records[name]["error"])
+
+    def test_concurrent_resume_marks_reused_with_zero_attempts(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("f", lambda r: (_ for _ in ()).throw(RuntimeError("f")))
+        g.add("b", lambda r: r["a"] + r["f"], ["a", "f"])
+        with self.assertRaises(TaskExecutionError):
+            g.run(max_concurrency=2, continue_on_error=True)
+        g.tasks["f"] = lambda r: 2
+        g.run(resume=True, max_concurrency=2, continue_on_error=True)
+        records = self._by_name(g.execution_trace())
+        self.assertEqual(records["a"]["status"], "reused")
+        self.assertEqual(records["a"]["attempts"], 0)
+        self.assertEqual(records["f"]["status"], "completed")
+        self.assertEqual(records["f"]["attempts"], 1)
+        self.assertEqual(records["b"]["status"], "completed")
+        self.assertEqual(records["b"]["attempts"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

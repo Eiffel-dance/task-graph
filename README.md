@@ -94,3 +94,20 @@ Tests: python3 -m unittest discover -s tests -v
 
 恢复运行完全兼容 `max_concurrency`、`continue_on_error` 与 `cancel_check`：分批时每批只从未完成节点中挑选，复用的完成节点不占名额；快速失败、继续执行、`TaskExecutionError`（以优先级拓扑序最早失败节点为主体）、失败记录以及依赖失败节点保持 `pending` 的规则全部沿用；取消时复用节点保持 `completed`，`TaskCancelledError.task_names` 只按优先级拓扑序列出本次尚未启动的节点，其余状态沿用既有取消规则；回调自身抛异常仍包装为 `TaskControlError`。若成功恢复后闭包内节点已全部为 `completed`，则不调用任何任务，直接按原序返回全部结果并保留旧快照。`plan`、`order`、`add` 以及不传 `resume` 的 `run` 均不受影响；`execution_state()` 仍返回相互独立的快照副本。
 
+## Execution trace audit
+
+`execution_trace()` 是只读的执行审计入口：返回最近一次**建立执行快照的 run** 的全新列表，解释该次 run 如何得到当前 `execution_state()`。此前没有任何运行快照时返回空列表（仅有 `plan`、`order`、`add` 不算运行；空图成功运行也会留下快照）。`plan`、`order`、`add` 以及参数校验或整图校验失败都不会生成或替换轨迹；只有真正建立快照的 `run`（包括失败、取消、回调异常及发生了重调度的 resume）才写入轨迹。每次调用都返回全新的深拷贝列表，调用方修改返回值（含嵌套的 `errors`/`error`）不影响后续查询。
+
+轨迹按本次 run 的优先级拓扑顺序排列，每个执行闭包内任务恰好一条记录，字段为：
+
+- `task_name`：任务名称；
+- `status`：`completed`（成功）、`failed`（最终失败）、`blocked`（`continue_on_error` 下被失败依赖阻断而未调用）、`cancelled`（取消或控制回调异常导致未启动）、`reused`（`resume=True` 复用上一快照中 `completed` 的任务）、`pending`（快速失败时尚未调度）；
+- `attempts`：本次 run 实际调用该任务函数的次数（复用为 `0`，取消/阻断/未调度均为 `0`）；
+- `errors`：按调用次序保存每次失败尝试的 `type` 与 `message`，重试成功后仍保留此前失败尝试；
+- `error`：最终异常摘要（`type` 与 `message`）或 `None`。
+
+重试只增加同一条记录的 `attempts` 并向 `errors` 追加每次失败，最终 `error` 始终采用最后一次异常；重试成功时 `status` 为 `completed`、`error` 为 `None`。目标闭包外的任务不出现在轨迹中。并发模式下，记录顺序与每个任务的 `attempts`/`errors` 都按确定的任务顺序归并，不受线程完成先后影响（各工作线程独立累计本任务尝试，整批收束后按优先级拓扑序写回）。
+
+`cancel_check`、`TaskControlError`、`TaskCancelledError`、`TaskResumeError` 以及既有 `KeyError`/`ValueError`/`TypeError` 的触发条件与优先级保持不变：控制回调异常时只保留已开始任务的记录，其余任务标记为 `cancelled`；resume 拒绝（无旧快照、图变更、范围变更）不替换旧轨迹；闭包已全部完成的 resume 不调用任务并保留旧快照及其轨迹。`execution_trace()` 不改变任何既有入口、默认参数、`execution_state()` 字段、快照独立性、返回映射顺序与失败传播规则。
+
+
