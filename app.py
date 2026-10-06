@@ -81,6 +81,11 @@ class TaskGraph:
         # before reusing anything, so a structural or targets-closure
         # change is rejected while the old snapshot stays in place.
         self._state_fingerprint = None
+        # Audit trail of the run that most recently established an
+        # execution snapshot: one record per closure task, in that run's
+        # priority topological order. Replaced exactly when self._state
+        # is replaced — plan/order/add and rejected runs never touch it.
+        self._trace = []
 
     def add(self, name, fn, depends=(), *, priority=0):
         # Validate everything before mutating anything: a rejected
@@ -197,6 +202,40 @@ class TaskGraph:
                 entry["error"] = dict(entry["error"])
             snapshot[name] = entry
         return snapshot
+
+    def execution_trace(self):
+        """Return an independent audit trace of the run that most recently
+        established an execution snapshot, as a brand-new list.
+
+        The list holds one record per task of that run's closure, in the
+        run's priority topological order. Each record carries:
+
+          - task_name: the task's name;
+          - status: "completed" (called and succeeded), "failed" (final
+            failure after its retries), "blocked" (never called because a
+            dependency failed under continue_on_error), "cancelled"
+            (never started when cancellation or a control-callback
+            exception took effect), "reused" (completed result reused by
+            resume=True) or "pending" (never scheduled before a fast
+            failure stopped the run);
+          - attempts: how many times the task function was actually
+            called this run (retries included; 0 for tasks never called);
+          - errors: one {"type", "message"} summary per failed call, in
+            call order;
+          - error: the final exception's summary, or None.
+
+        With no run snapshot yet the result is an empty list. Mutating
+        the returned list or its records does not affect the graph's
+        internal state or later queries.
+        """
+        trace = []
+        for record in self._trace:
+            entry = dict(record)
+            entry["errors"] = [dict(error) for error in record["errors"]]
+            if entry["error"] is not None:
+                entry["error"] = dict(entry["error"])
+            trace.append(entry)
+        return trace
 
     def _normalize_targets(self, targets):
         # Validate a targets argument completely before ordering, execution
@@ -380,8 +419,12 @@ class TaskGraph:
         # nodes keep a completed record carrying their old result; every
         # other node starts from an empty pending placeholder, so old
         # failed/cancelled result/error values never linger. The
-        # snapshot covers exactly the executed closure.
+        # snapshot covers exactly the executed closure. The audit trace
+        # is established together with the snapshot: one record per
+        # closure task in priority topological order, "reused" for
+        # reused completions and "pending" for everything else.
         state = {}
+        trace = []
         for name in run_order:
             if name in reused:
                 state[name] = {
@@ -389,21 +432,32 @@ class TaskGraph:
                     "result": self._state[name]["result"],
                     "error": None,
                 }
+                record = {
+                    "task_name": name, "status": "reused",
+                    "attempts": 0, "errors": [], "error": None,
+                }
             else:
                 state[name] = {
                     "status": "pending", "result": None, "error": None
                 }
+                record = {
+                    "task_name": name, "status": "pending",
+                    "attempts": 0, "errors": [], "error": None,
+                }
+            trace.append(record)
         self._state = state
+        self._trace = trace
         self._state_fingerprint = self._fingerprint()
         if max_concurrency > 1:
             return self._run_concurrent(
                 run_order, state, max_retries, continue_on_error,
-                max_concurrency, limits, cancel_check, reused,
+                max_concurrency, limits, cancel_check, reused, trace,
             )
         results = {
             name: state[name]["result"]
             for name in run_order if name in reused
         }
+        trace_by_name = {record["task_name"]: record for record in trace}
         # "dead" nodes are failures plus everything that can no longer run
         # because it (transitively) depends on one. The run still advances
         # strictly in priority topological order.
@@ -421,6 +475,7 @@ class TaskGraph:
             # pending placeholder (result/error both None).
             if self.deps[name] & dead:
                 dead.add(name)
+                trace_by_name[name]["status"] = "blocked"
                 continue
             # Cooperative cancellation is consulted exactly once per task
             # that (re)starts this run, in priority topological order,
@@ -429,10 +484,11 @@ class TaskGraph:
             # truthy result spends none of this task's retries; a raising
             # callback aborts as TaskControlError.
             if cancel_check is not None:
-                if self._poll_cancel(cancel_check, run_order, state):
-                    cancelled = self._mark_cancelled(run_order, state)
+                if self._poll_cancel(cancel_check, run_order, state, trace):
+                    cancelled = self._mark_cancelled(run_order, state, trace)
                     raise TaskCancelledError(cancelled)
             state[name]["status"] = "running"
+            record = trace_by_name[name]
             # Retry budgets are per task and counted afresh for this
             # recovery: a retry_limits entry overrides max_retries for
             # this task alone, and attempts spent in the previous run do
@@ -443,13 +499,23 @@ class TaskGraph:
                 # only its declared upstream values (reused or freshly
                 # computed); ordering keys keeps calls reproducible.
                 inputs = {d: results[d] for d in sorted(self.deps[name])}
+                record["attempts"] += 1
                 try:
                     value = self.tasks[name](inputs)
                 except Exception as exc:
+                    record["errors"].append({
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    })
                     if attempt < budget:
                         continue  # retry the same task immediately
                     state[name]["status"] = "failed"
                     state[name]["error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                    record["status"] = "failed"
+                    record["error"] = {
                         "type": type(exc).__name__,
                         "message": str(exc),
                     }
@@ -463,6 +529,7 @@ class TaskGraph:
                     break
                 state[name]["status"] = "completed"
                 state[name]["result"] = value
+                record["status"] = "completed"
                 results[name] = value
                 break
         if failures:
@@ -509,7 +576,7 @@ class TaskGraph:
             if self._state[name]["status"] == "completed"
         }
 
-    def _poll_cancel(self, cancel_check, run_order, state):
+    def _poll_cancel(self, cancel_check, run_order, state, trace):
         # One polling point: the callback takes no arguments and any
         # truthy value counts as a cancellation request. An exception
         # raised by the callback becomes a TaskControlError whose
@@ -520,26 +587,28 @@ class TaskGraph:
         try:
             requested = bool(cancel_check())
         except Exception as exc:
-            self._mark_cancelled(run_order, state)
+            self._mark_cancelled(run_order, state, trace)
             raise TaskControlError(exc) from exc
         return requested
 
     @staticmethod
-    def _mark_cancelled(run_order, state):
+    def _mark_cancelled(run_order, state, trace):
         # Flip every record that never started to "cancelled", walking
         # the priority topological order so the returned names are stable
         # too. Completed/failed records (with results or final errors)
-        # are left exactly as they settled.
+        # are left exactly as they settled, and so are their trace
+        # records; trace order already follows run_order.
         cancelled = []
-        for name in run_order:
+        for name, record in zip(run_order, trace):
             if state[name]["status"] == "pending":
                 state[name]["status"] = "cancelled"
+                record["status"] = "cancelled"
                 cancelled.append(name)
         return cancelled
 
     def _run_concurrent(self, run_order, state, max_retries,
                         continue_on_error, max_concurrency, retry_limits,
-                        cancel_check=None, reused=frozenset()):
+                        cancel_check=None, reused=frozenset(), trace=()):
         """Batch scheduler used when max_concurrency > 1.
 
         Each round starts at most max_concurrency ready tasks — those whose
@@ -551,14 +620,15 @@ class TaskGraph:
         ready nodes encountered there are exactly the k order() would start
         next; nothing about the batching re-sorts them. Everything
         observable (input mappings, results key order, failure selection,
-        state records) follows that priority topological order, never the
-        order in which concurrent tasks happen to finish.
+        state records, trace records) follows that priority topological
+        order, never the order in which concurrent tasks happen to finish.
 
         On a resumed run, reused nodes are already completed in state:
         their results seed the mapping below, they never enter pending or
         a batch and therefore never occupy a concurrency slot.
         """
         position = {name: i for i, name in enumerate(run_order)}
+        trace_by_name = {record["task_name"]: record for record in trace}
         results = {
             name: state[name]["result"]
             for name in run_order if name in reused
@@ -576,14 +646,21 @@ class TaskGraph:
             # a brand-new mapping of its direct dependencies, exactly as in
             # the sequential scheduler. results is only written by the
             # scheduler thread between batches, so reads here are safe.
+            # Every failed call is collected in call order; the scheduler
+            # thread merges them into the trace record deterministically.
+            errors = []
             last = None
             for _ in range(retry_limits.get(name, max_retries) + 1):
                 inputs = {d: results[d] for d in sorted(self.deps[name])}
                 try:
-                    return True, self.tasks[name](inputs), None
+                    return True, self.tasks[name](inputs), None, errors
                 except Exception as exc:
                     last = exc
-            return False, None, last
+                    errors.append({
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    })
+            return False, None, last, errors
 
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
             while pending:
@@ -596,6 +673,7 @@ class TaskGraph:
                     # through whole chains.
                     if self.deps[name] & dead:
                         dead.add(name)
+                        trace_by_name[name]["status"] = "blocked"
                     elif all(d in results for d in self.deps[name]):
                         ready.append(name)
                 if not ready:
@@ -612,8 +690,11 @@ class TaskGraph:
                 # already-submitted batch recorded, because rounds only
                 # advance once a whole batch has settled.
                 if cancel_check is not None:
-                    if self._poll_cancel(cancel_check, run_order, state):
-                        cancelled = self._mark_cancelled(run_order, state)
+                    if self._poll_cancel(cancel_check, run_order, state,
+                                         trace):
+                        cancelled = self._mark_cancelled(
+                            run_order, state, trace
+                        )
                         raise TaskCancelledError(cancelled)
                 batch = ready[:max_concurrency]
                 launched = set(batch)
@@ -630,14 +711,23 @@ class TaskGraph:
                 # outcomes are applied in priority topological order, never
                 # in completion order.
                 for name in batch:
-                    ok, value, exc = outcomes[name]
+                    ok, value, exc, errors = outcomes[name]
+                    record = trace_by_name[name]
+                    record["attempts"] += len(errors) + (1 if ok else 0)
+                    record["errors"].extend(errors)
                     if ok:
                         state[name]["status"] = "completed"
                         state[name]["result"] = value
+                        record["status"] = "completed"
                         results[name] = value
                     else:
                         state[name]["status"] = "failed"
                         state[name]["error"] = {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                        record["status"] = "failed"
+                        record["error"] = {
                             "type": type(exc).__name__,
                             "message": str(exc),
                         }
