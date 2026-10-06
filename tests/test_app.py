@@ -7,6 +7,7 @@ from app import (
     TaskControlError,
     TaskResumeError,
     TaskCycleError,
+    TaskResourceError,
 )
 
 
@@ -3905,6 +3906,441 @@ class ExecutionTraceTest(unittest.TestCase):
         self.assertEqual(records["f"]["attempts"], 1)
         self.assertEqual(records["b"]["status"], "completed")
         self.assertEqual(records["b"]["attempts"], 1)
+
+
+class ResourceConstraintTest(unittest.TestCase):
+    # --- exception ----------------------------------------------------
+
+    def test_resource_error_fields(self):
+        err = TaskResourceError("t", "db", 4, 2)
+        self.assertEqual(err.task_name, "t")
+        self.assertEqual(err.resource, "db")
+        self.assertEqual(err.requested, 4)
+        self.assertEqual(err.limit, 2)
+        self.assertIn("t", str(err))
+        self.assertIn("db", str(err))
+
+    # --- add(resources=...) ------------------------------------------
+
+    def test_resources_is_keyword_only_and_defaults_to_empty(self):
+        g = TaskGraph()
+        with self.assertRaises(TypeError):
+            g.add("t", lambda r: 1, (), 0, {"db": 1})
+        g.add("t", lambda r: 1)
+        self.assertEqual(g.resources["t"], {})
+        g.add("u", lambda r: 1, resources=None)
+        self.assertEqual(g.resources["u"], {})
+        g.add("v", lambda r: 1, resources={"db": 2, "gpu": 1})
+        self.assertEqual(g.resources["v"], {"db": 2, "gpu": 1})
+
+    def test_resources_non_mapping_rejected_without_mutation(self):
+        for bad in (["db"], ("db",), "db", 1, 1.5, True, object()):
+            g = TaskGraph()
+            g.add("ok", lambda r: 7)
+            with self.assertRaises(TypeError) as ctx:
+                g.add("bad", lambda r: 1, resources=bad)
+            self.assertIn("resources", str(ctx.exception))
+            self.assertEqual(set(g.tasks), {"ok"})
+            self.assertEqual(set(g.resources), {"ok"})
+            self.assertEqual(g.order(), ["ok"])
+
+    def test_resources_non_string_or_empty_key_rejected(self):
+        for bad, exc in (({1: 1}, TypeError), ({None: 1}, TypeError),
+                         ({b"db": 1}, TypeError), ({"": 1}, ValueError)):
+            g = TaskGraph()
+            with self.assertRaises(exc):
+                g.add("t", lambda r: 1, resources=bad)
+            self.assertEqual(g.tasks, {})
+            self.assertEqual(g.resources, {})
+
+    def test_resources_value_must_be_non_boolean_positive_integer(self):
+        for bad in ({"db": True}, {"db": False}, {"db": 1.5},
+                    {"db": "1"}, {"db": None}):
+            g = TaskGraph()
+            with self.assertRaises(TypeError):
+                g.add("t", lambda r: 1, resources=bad)
+            self.assertEqual(g.tasks, {})
+        for bad in ({"db": 0}, {"db": -3}):
+            g = TaskGraph()
+            with self.assertRaises(ValueError):
+                g.add("t", lambda r: 1, resources=bad)
+            self.assertEqual(g.tasks, {})
+
+    def test_resources_validation_precedes_duplicate_check(self):
+        g = TaskGraph()
+        g.add("x", lambda r: 1, resources={"db": 1})
+        with self.assertRaises(TypeError):
+            g.add("x", lambda r: 1, resources=1)
+        with self.assertRaises(ValueError) as ctx:
+            g.add("x", lambda r: 1, resources={"gpu": 2})
+        self.assertIn("duplicate task", str(ctx.exception))
+        self.assertEqual(g.resources["x"], {"db": 1})
+
+    def test_stored_resources_are_an_independent_copy(self):
+        declared = {"db": 2}
+        g = TaskGraph()
+        g.add("t", lambda r: 1, resources=declared)
+        declared["db"] = 99
+        declared["gpu"] = 1
+        self.assertEqual(g.resources["t"], {"db": 2})
+
+    def test_failed_resources_registration_preserves_snapshot(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7)
+        self.assertEqual(g.run(), {"ok": 7})
+        before = g.execution_state()
+        with self.assertRaises(TypeError):
+            g.add("bad", lambda r: 1, resources={"db": True})
+        with self.assertRaises(ValueError):
+            g.add("bad2", lambda r: 1, resources={"db": 0})
+        self.assertEqual(g.execution_state(), before)
+
+    # --- run(resource_limits=...) validation -------------------------
+
+    def test_resource_limits_non_mapping_rejected_before_execution(self):
+        for bad in (["db"], ("db",), "db", 1, 1.5, True, object()):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7,
+                  resources={"db": 1})
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(TypeError) as ctx:
+                g.run(resource_limits=bad)
+            self.assertIn("resource_limits", str(ctx.exception))
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_resource_limits_key_and_value_types_rejected(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 7, resources={"db": 1})
+        g.run()
+        before = g.execution_state()
+        for bad in ({1: 1}, {None: 1}, {b"db": 1}):
+            with self.assertRaises(TypeError):
+                g.run(resource_limits=bad)
+        for bad in ({"db": True}, {"db": False}, {"db": 1.5},
+                    {"db": "1"}, {"db": None}):
+            with self.assertRaises(TypeError):
+                g.run(resource_limits=bad)
+        for bad in ({"db": 0}, {"db": -2}):
+            with self.assertRaises(ValueError):
+                g.run(resource_limits=bad)
+        self.assertEqual(g.execution_state(), before)
+
+    def test_unknown_resource_key_rejected_before_execution(self):
+        for bad in ({"ghost": 1}, {"db": 1, "ghost": 1}):
+            g = TaskGraph()
+            calls = []
+            g.add("ok", lambda r: calls.append(1) or 7,
+                  resources={"db": 1})
+            self.assertEqual(g.run(), {"ok": 7})
+            before = g.execution_state()
+            with self.assertRaises(KeyError) as ctx:
+                g.run(resource_limits=bad)
+            self.assertIn("ghost", str(ctx.exception))
+            self.assertEqual(calls, [1])
+            self.assertEqual(g.execution_state(), before)
+
+    def test_resource_limits_is_keyword_only(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1, resources={"db": 1})
+        with self.assertRaises(TypeError):
+            g.run(0, False, None, 1, None, None, False, {"db": 1})
+
+    def test_resource_validation_fires_before_graph_validation(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 1)
+        g.run()
+        before = g.execution_state()
+        g.add("late", lambda r: None, depends=["ghost"])
+        with self.assertRaises(KeyError) as ctx:
+            g.run(resource_limits={"nope": 1})
+        self.assertIn("nope", str(ctx.exception))
+        self.assertEqual(g.execution_state(), before)
+
+    # --- infeasibility -------------------------------------------------
+
+    def test_demand_over_limit_raises_resource_error_before_anything(self):
+        calls = []
+        g = TaskGraph()
+        g.add("a", lambda r: calls.append("a") or 1)
+        g.add("big", lambda r: calls.append("big") or 2,
+              resources={"db": 3})
+        self.assertEqual(g.run(), {"a": 1, "big": 2})
+        before_state = g.execution_state()
+        before_trace = g.execution_trace()
+        with self.assertRaises(TaskResourceError) as ctx:
+            g.run(resource_limits={"db": 2})
+        err = ctx.exception
+        self.assertEqual(err.task_name, "big")
+        self.assertEqual(err.resource, "db")
+        self.assertEqual(err.requested, 3)
+        self.assertEqual(err.limit, 2)
+        self.assertEqual(calls, ["a", "big"])  # nothing ran
+        self.assertEqual(g.execution_state(), before_state)
+        self.assertEqual(g.execution_trace(), before_trace)
+
+    def test_infeasibility_reports_earliest_task_then_sorted_resource(self):
+        g = TaskGraph()
+        g.add("z", lambda r: 1, resources={"gpu": 2}, priority=10)
+        g.add("a", lambda r: 1, resources={"gpu": 5})
+        with self.assertRaises(TaskResourceError) as ctx:
+            g.run(resource_limits={"gpu": 1})
+        self.assertEqual(ctx.exception.task_name, "z")
+        self.assertEqual(ctx.exception.requested, 2)
+        g2 = TaskGraph()
+        g2.add("t", lambda r: 1, resources={"b": 5, "a": 3})
+        with self.assertRaises(TaskResourceError) as ctx:
+            g2.run(resource_limits={"a": 1, "b": 1})
+        self.assertEqual(ctx.exception.task_name, "t")
+        self.assertEqual(ctx.exception.resource, "a")
+
+    def test_demand_over_limit_outside_closure_is_not_rejected(self):
+        calls = []
+        g = TaskGraph()
+        g.add("ok", lambda r: calls.append("ok") or 1)
+        g.add("big", lambda r: calls.append("big") or 9,
+              resources={"db": 5})
+        self.assertEqual(
+            g.run(targets=["ok"], resource_limits={"db": 2}), {"ok": 1}
+        )
+        self.assertEqual(calls, ["ok"])
+        self.assertEqual(set(g.execution_state()), {"ok"})
+
+    def test_reused_over_limit_task_is_not_rejected_on_resume(self):
+        g = TaskGraph()
+        calls = []
+        g.add("big", lambda r: calls.append(1) or 1,
+              resources={"db": 5})
+        self.assertEqual(g.run(), {"big": 1})
+        # Reused without limits, then resumed with a smaller ceiling:
+        # nothing executes, so no demand is exerted and no error fires.
+        self.assertEqual(g.run(resume=True), {"big": 1})
+        self.assertEqual(
+            g.run(resume=True, resource_limits={"db": 2}), {"big": 1}
+        )
+        self.assertEqual(calls, [1])
+
+    def test_rerun_task_over_limit_on_resume_raises_before_snapshot(self):
+        g = TaskGraph()
+        g.add("big", lambda r: (_ for _ in ()).throw(RuntimeError("x")),
+              resources={"db": 5})
+        with self.assertRaises(TaskExecutionError):
+            g.run(continue_on_error=True)
+        before = g.execution_state()
+        with self.assertRaises(TaskResourceError) as ctx:
+            g.run(resume=True, continue_on_error=True,
+                  resource_limits={"db": 2})
+        self.assertEqual(ctx.exception.task_name, "big")
+        self.assertEqual(g.execution_state(), before)
+
+    # --- batching semantics -------------------------------------------
+
+    @staticmethod
+    def _guarded_tasks(lock, stats, name, amount, key="db", delay=0.03):
+        import time
+        def task(r):
+            if amount:
+                with lock:
+                    stats["current"][key] = stats["current"].get(key, 0) + amount
+                    stats["peak"][key] = max(
+                        stats["peak"].get(key, 0), stats["current"][key]
+                    )
+            time.sleep(delay)
+            if amount:
+                with lock:
+                    stats["current"][key] -= amount
+            return name
+        return task
+
+    def test_resource_ceiling_respected_and_reached(self):
+        import threading
+        import time
+        lock = threading.Lock()
+        stats = {"current": {}, "peak": {}}
+        g = TaskGraph()
+        for name, amount in (("a", 2), ("b", 2), ("c", 1)):
+            g.add(
+                name,
+                self._guarded_tasks(lock, stats, name, amount, delay=0.05),
+                resources={"db": amount},
+            )
+        started = time.time()
+        results = g.run(max_concurrency=4, resource_limits={"db": 3})
+        elapsed = time.time() - started
+        self.assertEqual(results, {"a": "a", "b": "b", "c": "c"})
+        self.assertEqual(stats["peak"], {"db": 3})
+        # a+b settle (0.05), then c runs — more than one serial tail.
+        self.assertGreater(elapsed, 0.08)
+
+    def test_batch_never_skips_a_ready_task_that_does_not_fit(self):
+        import time
+        order = []
+        def make(name):
+            def task(r):
+                order.append(name)
+                time.sleep(0.03)
+                return name
+            return task
+        g = TaskGraph()
+        # Ready in name order: a(1), b(2), c(1), ceiling 2. Round 1
+        # admits a; b would overflow and ends the round even though c
+        # would fit — c must not leapfrog b. Round 2 is b, round 3 c.
+        g.add("a", make("a"), resources={"db": 1})
+        g.add("b", make("b"), resources={"db": 2})
+        g.add("c", make("c"), resources={"db": 1})
+        results = g.run(max_concurrency=3, resource_limits={"db": 2})
+        self.assertEqual(order, ["a", "b", "c"])
+        self.assertEqual(list(results), ["a", "b", "c"])
+
+    def test_max_concurrency_still_caps_task_count(self):
+        import threading
+        import time
+        lock = threading.Lock()
+        current = {"n": 0}
+        peak = {"n": 0}
+        def task(r):
+            with lock:
+                current["n"] += 1
+                peak["n"] = max(peak["n"], current["n"])
+            time.sleep(0.04)
+            with lock:
+                current["n"] -= 1
+            return 1
+        g = TaskGraph()
+        for name in ("a", "b", "c", "d"):
+            g.add(name, task, resources={"db": 1})
+        results = g.run(max_concurrency=2, resource_limits={"db": 10})
+        self.assertEqual(peak["n"], 2)
+        self.assertEqual(set(results), {"a", "b", "c", "d"})
+
+    def test_unlisted_declared_resource_is_unlimited(self):
+        g = TaskGraph()
+        g.add("a", lambda r: "a", resources={"db": 2, "lease": 1})
+        g.add("b", lambda r: "b", resources={"db": 2, "lease": 9})
+        results = g.run(max_concurrency=2, resource_limits={"db": 4})
+        self.assertEqual(results, {"a": "a", "b": "b"})
+
+    def test_retries_hold_the_resources_until_settled(self):
+        import threading
+        import time
+        lock = threading.Lock()
+        current = {"n": 0}
+        peak = {"n": 0}
+        attempts = {"f": 0}
+        def flaky(r):
+            with lock:
+                current["n"] += 1
+                peak["n"] = max(peak["n"], current["n"])
+            time.sleep(0.03)
+            with lock:
+                current["n"] -= 1
+            attempts["f"] += 1
+            if attempts["f"] < 2:
+                raise RuntimeError("once")
+            return "ok"
+        g = TaskGraph()
+        g.add("f", flaky, resources={"db": 1})
+        g.add("o", lambda r: "o", resources={"db": 1})
+        results = g.run(
+            max_retries=1, max_concurrency=2,
+            resource_limits={"db": 1},
+        )
+        self.assertEqual(results, {"f": "ok", "o": "o"})
+        self.assertEqual(peak["n"], 1)  # o never overlaps f's retries
+
+    def test_blocked_tasks_never_occupy_resources(self):
+        def boom(r):
+            raise RuntimeError("x")
+        g = TaskGraph()
+        g.add("boom", boom, resources={"db": 1})
+        g.add("down", lambda r: 1, ["boom"], resources={"db": 1})
+        g.add("ind", lambda r: 1, resources={"db": 1})
+        with self.assertRaises(TaskExecutionError) as ctx:
+            g.run(max_concurrency=2, continue_on_error=True,
+                  resource_limits={"db": 1})
+        self.assertEqual(ctx.exception.task_name, "boom")
+        state = g.execution_state()
+        self.assertEqual(state["ind"]["status"], "completed")
+        self.assertEqual(state["down"]["status"], "pending")
+        records = {e["task_name"]: e
+                   for e in g.execution_trace()}
+        self.assertEqual(records["down"]["status"], "blocked")
+        self.assertEqual(records["ind"]["status"], "completed")
+
+    def test_cancel_polled_once_per_resource_round(self):
+        polls = []
+        g = TaskGraph()
+        for name in ("a", "b", "c"):
+            g.add(name, lambda r, n=name: n, resources={"db": 1})
+        results = g.run(
+            max_concurrency=3, resource_limits={"db": 1},
+            cancel_check=lambda: (polls.append(1), False)[1],
+        )
+        self.assertEqual(results, {"a": "a", "b": "b", "c": "c"})
+        self.assertEqual(polls, [1, 1, 1])
+
+    # --- compatibility -------------------------------------------------
+
+    def test_omitted_limits_keep_results_and_order_identical(self):
+        def build():
+            calls = []
+            g = TaskGraph()
+            g.add("a", lambda r: calls.append("a") or 1,
+                  resources={"db": 1})
+            g.add("b", lambda r: calls.append("b") or r["a"] + 1,
+                  ["a"], resources={"gpu": 1})
+            g.add("c", lambda r: calls.append("c") or 10)
+            g.add("d", lambda r: r["b"] + r["c"], ["b", "c"],
+                  resources={"db": 4})
+            return g, calls
+        for kwargs in ({}, {"max_concurrency": 3},
+                       {"resource_limits": None}):
+            g, calls = build()
+            self.assertEqual(g.plan(), ["a", "c", "b", "d"])
+            results = g.run(**kwargs)
+            self.assertEqual(list(results), ["a", "c", "b", "d"])
+            self.assertEqual(
+                results, {"a": 1, "c": 10, "b": 2, "d": 12}
+            )
+            self.assertEqual(calls, ["a", "c", "b"])
+
+    def test_inputs_results_and_state_fields_unchanged_with_limits(self):
+        seen = {}
+        g = TaskGraph()
+        g.add("a", lambda r: 1, resources={"db": 2})
+        g.add("b", lambda r: (seen.update(r), r["a"] + 1)[1],
+              ["a"], resources={"db": 1})
+        results = g.run(max_concurrency=2,
+                        resource_limits={"db": 2})
+        self.assertEqual(seen, {"a": 1})
+        self.assertEqual(results, {"a": 1, "b": 2})
+        for record in g.execution_state().values():
+            self.assertEqual(
+                set(record), {"status", "result", "error"}
+            )
+
+    # --- resume fingerprint -------------------------------------------
+
+    def test_changed_resource_declaration_is_a_graph_change(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, ["a"])
+        g.run()
+        before = g.execution_state()
+        g.resources["b"] = {"db": 1}
+        with self.assertRaises(TaskResumeError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.reason, "graph_changed")
+        self.assertEqual(g.execution_state(), before)
+        # Changing the run-time limits alone is not a graph change.
+        g2 = TaskGraph()
+        g2.add("a", lambda r: 1, resources={"db": 1})
+        g2.run()
+        self.assertEqual(
+            g2.run(resume=True, resource_limits={"db": 1}), {"a": 1}
+        )
 
 
 if __name__ == "__main__":

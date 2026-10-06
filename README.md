@@ -124,4 +124,21 @@ Tests: python3 -m unittest discover -s tests -v
 
 `cancel_check`、`TaskControlError`、`TaskCancelledError`、`TaskResumeError` 以及既有 `KeyError`/`ValueError`/`TypeError` 的触发条件与优先级保持不变：控制回调异常时只保留已开始任务的记录，其余任务标记为 `cancelled`；resume 拒绝（无旧快照、图变更、范围变更）不替换旧轨迹；闭包已全部完成的 resume 不调用任务并保留旧快照及其轨迹。`execution_trace()` 不改变任何既有入口、默认参数、`execution_state()` 字段、快照独立性、返回映射顺序与失败传播规则。
 
+## Declarative resource constraints
+
+`add(name, fn, ..., resources={...})` 增加一个仅限关键字传入的可选资源需求映射（省略或传 `None` 时视为空映射，位置参数解释不变）。键必须是非空字符串，表示数据库连接、GPU、租约槽位等有限资源的名称；值必须是排除布尔值的正整数，表示任务**每次执行**占用的资源单位。所有校验与重复任务检查一起，在注册改变图结构（`tasks`/`deps`/`priorities`/`resources`）之前完成：`resources` 不是映射抛出 `TypeError`；键不是字符串抛出 `TypeError`，空键抛出 `ValueError`；值是布尔值或不是整数抛出 `TypeError`，零或负数抛出 `ValueError`。注册被拒时图结构与上一份 `execution_state()` 快照原样保留；成功注册时保存的是入参映射的独立副本。
+
+`run(..., resource_limits={...})` 增加一个仅限关键字传入的资源上限映射。省略或传 `None` 时所有已声明资源均不设上限，旧调用的结果、顺序、快照与轨迹逐字保持；传入映射时只约束列出的资源，已声明但未列出的资源视为无限。整体校验在排序、任务调用、快照与轨迹替换之前完成：不是映射抛出 `TypeError`；键不是字符串抛出 `TypeError`；值是布尔值或不是整数抛出 `TypeError`，非正数抛出 `ValueError`；引用任何任务都未声明的资源键抛出 `KeyError`（多个未知键时按名称升序报告第一个）。校验失败不执行任何任务，上一份 `execution_state()` 与 `execution_trace()` 原样保留；`resource_limits` 不改变图结构，本身也不进入恢复指纹。
+
+某个任务在本次闭包内声明的需求超过某资源上限时，调度不可能容纳它：在任何任务执行、快照建立或轨迹替换之前抛出新的 `app.TaskResourceError`，其稳定字段为 `task_name`（按优先级拓扑序的首个不可容纳任务，目标闭包外与 resume 中复用的节点除外）、`resource`（该任务上按键名升序的首个超限资源）、`requested`（声明需求）与 `limit`（配置上限）。该异常不生成新快照，也不生成或替换轨迹。
+
+资源限制生效时，调度仍严格遵守现有优先级拓扑序与 `max_concurrency`：
+
+- 每轮按该顺序遍历就绪任务（全部直接依赖已成功完成）尝试组成批次，只有在仍有空余并发槽位、且加入后批次对每个受限资源的累计需求都不超过其上限时，任务才能进入本批次。
+- 遇到下一个就绪任务放不下（槽位已满或任一资源超限）时立即结束本轮，**不得越过它挑选后面的就绪任务**；该任务要等本轮批次及其重试全部收束、释放占用后，才在下一轮重新参与组装。不存在资源上限时，批次组装与历史的 `ready[:max_concurrency]` 前缀逐字一致。
+- 批次中每个任务从启动到全部尝试（含重试）收束都持续占用其资源，整批收束后才统一释放；被失败依赖阻断（`blocked`）的节点从不占用资源。
+- 单个任务的可行性已由运行前检查保证（每个需求不超过对应上限），因此空批次总能放入首个就绪任务，调度不会因资源死锁。
+
+资源约束不改变任务收到的直接依赖映射、结果、返回映射键序与 `execution_state()` 字段，并与既有机制协同：`targets` 闭包外的需求不参与可行性检查也不执行；`continue_on_error` 下失败节点的下游保持 `blocked`/`pending` 且不占资源；`cancel_check` 仍在每轮批次提交前轮询一次（资源使轮次变多，轮询次数随之增多）；轨迹字段、状态语义与并发下按优先级拓扑序归并结果的规则不变。resume 时复用的 `completed` 节点不被调用、不占槽位也不占资源，因此其超限需求不会触发 `TaskResourceError`，只有本次真正（重新）执行的节点参与可行性检查。恢复判定把资源声明视为图结构的一部分：任务集合、依赖、优先级或任一任务的资源声明变化都令 `resume=True` 以 `reason="graph_changed"` 拒绝旧快照；而仅改变运行参数 `resource_limits` 不是图变更。`plan()`、`order()` 不接受也不受 `resource_limits` 影响；不传 `resources` 或不传 `resource_limits` 的所有既有调用保持完全兼容。
+
 
