@@ -6,12 +6,14 @@ from app import (
     TaskCancelledError,
     TaskControlError,
     TaskResumeError,
+    TaskCycleError,
 )
 
 
 class SmokeTest(unittest.TestCase):
     def test_import(self):
         self.assertTrue(app)
+        self.assertIs(app.TaskCycleError, TaskCycleError)
 
 
 class MissingDependencyTest(unittest.TestCase):
@@ -85,6 +87,268 @@ class DuplicateAndCycleTest(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             g.order()
         self.assertIn("cycle detected", str(ctx.exception))
+
+
+class TaskCycleErrorTest(unittest.TestCase):
+    def _graph(self, edges, registration=None):
+        # edges maps a task name to its direct dependency names.
+        g = TaskGraph()
+        for name in (registration if registration is not None else sorted(edges)):
+            g.add(name, lambda r: None, depends=edges.get(name, ()))
+        return g
+
+    def test_exception_is_value_error_with_cycle_attribute(self):
+        err = TaskCycleError(["a", "a"])
+        self.assertIsInstance(err, ValueError)
+        self.assertEqual(err.cycle, ["a", "a"])
+        self.assertIn("a", str(err))
+
+    def test_cycle_attribute_is_an_independent_copy(self):
+        path = ["a", "b", "a"]
+        err = TaskCycleError(path)
+        path.append("tampered")
+        self.assertEqual(err.cycle, ["a", "b", "a"])
+        err.cycle.append("tampered")
+        self.assertEqual(TaskCycleError(["a", "b", "a"]).cycle, ["a", "b", "a"])
+
+    def test_self_dependency_cycle_is_name_twice(self):
+        g = self._graph({"a": ["a"]})
+        with self.assertRaises(TaskCycleError) as ctx:
+            g.order()
+        self.assertEqual(ctx.exception.cycle, ["a", "a"])
+        self.assertEqual(ctx.exception.cycle[0], ctx.exception.cycle[-1])
+        self.assertIn("a -> a", str(ctx.exception))
+
+    def test_two_node_cycle_path(self):
+        g = self._graph({"a": ["b"], "b": ["a"]})
+        for check in (g.order, g.plan, lambda: g.run()):
+            with self.assertRaises(TaskCycleError) as ctx:
+                check()
+            self.assertEqual(ctx.exception.cycle, ["a", "b", "a"])
+
+    def test_multi_node_cycle_walks_task_to_dependency_edges(self):
+        g = self._graph({"a": ["b"], "b": ["c"], "c": ["a"]})
+        with self.assertRaises(TaskCycleError) as ctx:
+            g.order()
+        self.assertEqual(ctx.exception.cycle, ["a", "b", "c", "a"])
+
+    def test_first_and_last_node_are_identical_and_nonempty(self):
+        g = self._graph(
+            {"a": ["b"], "b": ["c"], "c": ["b"], "d": []}
+        )
+        with self.assertRaises(TaskCycleError) as ctx:
+            g.order()
+        cycle = ctx.exception.cycle
+        self.assertTrue(cycle)
+        self.assertEqual(cycle[0], cycle[-1])
+        self.assertEqual(cycle, ["b", "c", "b"])
+
+    def test_path_carries_no_node_outside_the_loop(self):
+        # d -> a feeds into the loop a -> b -> c -> a, but d is not on it.
+        g = self._graph(
+            {"d": ["a"], "a": ["b"], "b": ["c"], "c": ["a"]}
+        )
+        with self.assertRaises(TaskCycleError) as ctx:
+            g.order()
+        self.assertEqual(ctx.exception.cycle, ["a", "b", "c", "a"])
+        self.assertNotIn("d", ctx.exception.cycle)
+
+    def test_first_of_several_cycles_is_reported(self):
+        # Two disjoint loops; the ascending-name one (a <-> b) wins.
+        edges = {"x": ["y"], "y": ["x"], "a": ["b"], "b": ["a"]}
+        self.assertEqual(
+            self._cycle_of(edges), ["a", "b", "a"]
+        )
+        # Shared-node loops: from a the ascending dependency b is
+        # explored before c, so a -> b -> a is the first closure.
+        self.assertEqual(
+            self._cycle_of({"a": ["b", "c"], "b": ["a"], "c": ["a"]}),
+            ["a", "b", "a"],
+        )
+
+    def _cycle_of(self, edges):
+        g = self._graph(edges)
+        try:
+            g.order()
+        except TaskCycleError as exc:
+            return exc.cycle
+        self.fail("expected TaskCycleError")
+
+    def test_registration_order_leaves_cycle_unchanged(self):
+        edges = {"x": ["y"], "y": ["x"], "a": ["b"], "b": ["a"]}
+        paths = set()
+        for registration in (
+            ["a", "b", "x", "y"],
+            ["y", "x", "b", "a"],
+            ["x", "a", "y", "b"],
+            ["b", "y", "a", "x"],
+        ):
+            g = self._graph(edges, registration=registration)
+            with self.assertRaises(TaskCycleError) as ctx:
+                g.order()
+            paths.add(tuple(ctx.exception.cycle))
+        self.assertEqual(paths, {("a", "b", "a")})
+
+    def test_cycle_does_not_depend_on_targets_container_or_run_flags(self):
+        edges = {
+            "a": ["b"], "b": ["a"],
+            "ok": [], "other": ["ok"],
+        }
+        expected = ["a", "b", "a"]
+        for kwargs in (
+            {},
+            {"targets": ["ok"]},
+            {"targets": ("ok",)},
+            {"targets": {"ok"}},
+            {"targets": ["other"]},
+            {"max_retries": 3},
+            {"continue_on_error": True},
+            {"max_concurrency": 4},
+            {"max_concurrency": 2, "max_retries": 2,
+             "continue_on_error": True},
+            {"cancel_check": lambda: True},
+            {"retry_limits": {"ok": 5}},
+            {"resume": True},
+            {"targets": ["ok"], "max_concurrency": 3, "resume": True,
+             "cancel_check": lambda: True},
+        ):
+            g = self._graph(edges, registration=["a", "ok", "b", "other"])
+            with self.assertRaises(TaskCycleError) as ctx:
+                g.run(**kwargs)
+            self.assertEqual(
+                ctx.exception.cycle, expected, msg=repr(kwargs)
+            )
+
+    def test_plan_and_order_report_the_same_cycle_as_run(self):
+        edges = {"a": ["b"], "b": ["c"], "c": ["a"], "ok": []}
+        for registration in (["a", "b", "c", "ok"], ["ok", "c", "a", "b"]):
+            g = self._graph(edges, registration=registration)
+            with self.assertRaises(TaskCycleError) as ctx:
+                g.order()
+            self.assertEqual(ctx.exception.cycle, ["a", "b", "c", "a"])
+            with self.assertRaises(TaskCycleError) as ctx:
+                g.plan()
+            self.assertEqual(ctx.exception.cycle, ["a", "b", "c", "a"])
+            with self.assertRaises(TaskCycleError) as ctx:
+                g.plan(["ok"])
+            self.assertEqual(ctx.exception.cycle, ["a", "b", "c", "a"])
+
+    def test_cycle_outside_targets_closure_is_still_reported(self):
+        edges = {"a": ["b"], "b": ["a"], "ok": []}
+        g = self._graph(edges)
+        with self.assertRaises(TaskCycleError) as ctx:
+            g.run(targets=["ok"])
+        self.assertEqual(ctx.exception.cycle, ["a", "b", "a"])
+        self.assertEqual(g.execution_state(), {})
+        self.assertEqual(g.execution_trace(), [])
+
+    def test_missing_dependency_still_takes_priority_over_cycle(self):
+        # The same node a is both in a loop and missing a dependency:
+        # the historical KeyError must win.
+        g = TaskGraph()
+        g.add("a", lambda r: None, depends=["b", "ghost"])
+        g.add("b", lambda r: None, depends=["a"])
+        for check in (g.order, g.plan, g.run):
+            with self.assertRaises(KeyError):
+                check()
+        # And a missing edge elsewhere still beats a present cycle.
+        g2 = TaskGraph()
+        g2.add("a", lambda r: None, depends=["b"])
+        g2.add("b", lambda r: None, depends=["a"])
+        g2.add("z", lambda r: None, depends=["phantom"])
+        with self.assertRaises(KeyError) as ctx:
+            g2.order()
+        self.assertIn("phantom", ctx.exception.args[0])
+
+    def test_cycle_calls_no_task_and_preserves_state_and_trace(self):
+        calls = []
+        g = TaskGraph()
+        g.add("ok", lambda r: calls.append("ok") or 1)
+        self.assertEqual(g.run(), {"ok": 1})
+        state_before = g.execution_state()
+        trace_before = g.execution_trace()
+        g.add("a", lambda r: calls.append("a"), depends=["b"])
+        g.add("b", lambda r: calls.append("b"), depends=["a"])
+        with self.assertRaises(TaskCycleError):
+            g.run()
+        with self.assertRaises(TaskCycleError):
+            g.run(targets=["ok"], max_concurrency=2)
+        with self.assertRaises(TaskCycleError):
+            g.plan(["ok"])
+        self.assertEqual(calls, ["ok"])
+        self.assertEqual(g.execution_state(), state_before)
+        self.assertEqual(g.execution_trace(), trace_before)
+
+    def test_resume_still_whole_graph_validates_cycle(self):
+        g = TaskGraph()
+        g.add("ok", lambda r: 1)
+        g.run()
+        before = g.execution_state()
+        # A resume against an untouched graph succeeds (control case)...
+        self.assertEqual(g.run(resume=True), {"ok": 1})
+        # ...but introducing a cycle fails whole-graph validation before
+        # any resume snapshot check and without a task call or snapshot
+        # replacement.
+        g.add("a", lambda r: None, depends=["b"])
+        g.add("b", lambda r: None, depends=["a"])
+        with self.assertRaises(TaskCycleError) as ctx:
+            g.run(resume=True)
+        self.assertEqual(ctx.exception.cycle, ["a", "b", "a"])
+        self.assertEqual(g.execution_state(), before)
+
+    def test_order_and_plan_do_not_mutate_the_graph(self):
+        g = self._graph({"a": ["b"], "b": ["a"]})
+        tasks_before = dict(g.tasks)
+        deps_before = {k: set(v) for k, v in g.deps.items()}
+        priorities_before = dict(g.priorities)
+        for _ in range(3):
+            with self.assertRaises(TaskCycleError):
+                g.order()
+            with self.assertRaises(TaskCycleError):
+                g.plan()
+        self.assertEqual(g.tasks, tasks_before)
+        self.assertEqual(g.deps, deps_before)
+        self.assertEqual(g.priorities, priorities_before)
+        self.assertEqual(g.execution_state(), {})
+        self.assertEqual(g.execution_trace(), [])
+
+    def test_message_stably_contains_the_full_path(self):
+        g = self._graph({"a": ["b"], "b": ["c"], "c": ["a"]})
+        with self.assertRaises(TaskCycleError) as ctx:
+            g.order()
+        message = str(ctx.exception)
+        self.assertIn("a", message)
+        self.assertIn("b", message)
+        self.assertIn("c", message)
+        self.assertIn("cycle detected", message)
+
+    def test_acyclic_graphs_order_and_run_unchanged(self):
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: r["a"] + 1, depends=["a"])
+        g.add("c", lambda r: 10)
+        g.add("d", lambda r: r["b"] + r["c"], depends=["b", "c"])
+        self.assertEqual(g.order(), ["a", "c", "b", "d"])
+        self.assertEqual(g.plan(), ["a", "c", "b", "d"])
+        self.assertEqual(g.run(), {"a": 1, "c": 10, "b": 2, "d": 12})
+
+    def test_direct_dependency_inputs_unchanged_around_cycle_check(self):
+        seen = {}
+        g = TaskGraph()
+        g.add("a", lambda r: 1)
+        g.add("b", lambda r: (seen.update(r), r["a"] + 1)[1],
+              depends=["a"])
+        g.add("loopy", lambda r: None, depends=["loopy"])
+        with self.assertRaises(TaskCycleError):
+            g.plan()
+        # Remove the loop node's function reach by rebuilding: a graph
+        # without the cycle still hands tasks sorted direct-dep inputs.
+        g2 = TaskGraph()
+        g2.add("a", lambda r: 1)
+        g2.add("b", lambda r: (seen.update({"b": r}), r["a"] + 1)[1],
+               depends=["a"])
+        g2.run()
+        self.assertEqual(list(seen["b"]), ["a"])
 
 
 class InputBoundaryTest(unittest.TestCase):

@@ -68,6 +68,30 @@ class TaskResumeError(Exception):
         super().__init__("cannot resume run: %s" % reason)
 
 
+class TaskCycleError(ValueError):
+    """Raised when order(), plan() or run() validate a graph with a cycle.
+
+    cycle is a non-empty list of task names tracing the actual loop
+    along "task -> direct dependency" edges, with the first node
+    repeated at the end; a task depending on itself is therefore
+    [name, name]. Detection is fully deterministic — roots and direct
+    dependencies are visited in ascending task-name order, and only
+    the first loop closed by an edge back to the current DFS path is
+    reported, sliced from the first occurrence of its first node so no
+    unrelated nodes tag along. Registration order, the targets
+    container and every run() parameter leave both the exception type
+    and this path unchanged. As a ValueError subclass it keeps the
+    historical cycle exception type; the same path is also embedded in
+    the message.
+    """
+
+    def __init__(self, cycle):
+        self.cycle = list(cycle)
+        super().__init__(
+            "cycle detected: %s" % " -> ".join(self.cycle)
+        )
+
+
 class TaskGraph:
     def __init__(self):
         self.tasks = {}
@@ -138,6 +162,51 @@ class TaskGraph:
                     "task %r depends on missing task %r" % (name, missing[0])
                 )
 
+    def _find_cycle(self):
+        # Deterministic first cycle over "task -> direct dependency"
+        # edges. Three-color DFS: start nodes are picked in ascending
+        # task-name order and each node's direct dependencies are
+        # descended into in ascending name order, so the outcome depends
+        # only on names and edges, never on registration order or dict
+        # iteration. The first edge that closes back onto a node on the
+        # current DFS path wins; the reported loop is sliced from that
+        # node's first position on the path and repeats it at the end,
+        # carrying no node outside the loop. A self-edge therefore comes
+        # back as [name, name]. Returns None for an acyclic graph; this
+        # runs only after _check_dependencies(), so every edge resolves.
+        # The traversal keeps an explicit stack (rather than Python call
+        # frames) so a long acyclic chain cannot trip the recursion limit.
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {name: WHITE for name in self.tasks}
+        for root in sorted(self.tasks):
+            if color[root] != WHITE:
+                continue
+            color[root] = GRAY
+            path = [root]
+            position = {root: 0}
+            stack = [(root, iter(sorted(self.deps[root])))]
+            while stack:
+                node, deps = stack[-1]
+                descended = False
+                for dep in deps:
+                    if color[dep] == GRAY:
+                        return path[position[dep]:] + [dep]
+                    if color[dep] == WHITE:
+                        color[dep] = GRAY
+                        position[dep] = len(path)
+                        path.append(dep)
+                        stack.append((dep, iter(sorted(self.deps[dep]))))
+                        descended = True
+                        break
+                    # BLACK dependencies are already fully explored.
+                if descended:
+                    continue
+                stack.pop()
+                path.pop()
+                del position[node]
+                color[node] = BLACK
+        return None
+
     def order(self):
         # Priority-aware Kahn traversal. Nodes enter the ready queue once
         # their direct dependencies are all satisfied; the dependency-free
@@ -151,7 +220,16 @@ class TaskGraph:
         # is the pre-priority stable sequence, name for name; priorities
         # only promote ready nodes ahead of lower-priority ones, and a
         # dependency is always emitted before its successors.
+        #
+        # Missing dependencies keep their historical KeyError and are
+        # checked first; only a fully resolved graph is cycle-checked, via
+        # the deterministic DFS that raises TaskCycleError carrying the
+        # first closed path. Both checks are read-only and run before any
+        # ordering result is produced.
         self._check_dependencies()
+        cycle = self._find_cycle()
+        if cycle is not None:
+            raise TaskCycleError(cycle)
         deps = {k: set(v) for k, v in self.deps.items()}
         remaining = set(deps)
         ready = []  # (priority, intake_position, name)
@@ -183,8 +261,6 @@ class TaskGraph:
                     if not deps[child]:
                         newly_ready.append(child)
             enqueue(newly_ready)
-        if len(out) != len(deps):
-            raise ValueError("cycle detected")
         return out
 
     def execution_state(self):
@@ -345,9 +421,10 @@ class TaskGraph:
         task names is deduplicated and closed over transitive dependencies,
         and the result is the projection of the full priority topological
         order onto that closure. Validation mirrors run(): bad targets
-        raise TypeError/ValueError/KeyError, and missing dependencies or
-        cycles anywhere in the graph raise KeyError/ValueError — all before
-        any ordering result is produced. No task function is called, no
+        raise TypeError/ValueError/KeyError, missing dependencies raise
+        KeyError and any cycle anywhere in the graph raises
+        TaskCycleError (a ValueError subclass) carrying its deterministic
+        cycle path — all before any ordering result is produced. No task function is called, no
         execution_state snapshot is created or replaced, and the graph is
         never mutated. Each successful call returns a new list, so callers
         may freely mutate the result.

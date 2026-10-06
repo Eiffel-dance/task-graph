@@ -9,6 +9,20 @@ Tests: python3 -m unittest discover -s tests -v
 
 实现一个可校验的任务有向无环图执行器。它应支持添加带依赖的任务、检测重复节点与环、按稳定拓扑序执行，并在失败时保留已完成和失败节点的可观察状态。调度结果必须可复现，任务函数只接收明确输入，后续可在同一接口上接入并发和重试策略。
 
+## 确定性环诊断（TaskCycleError）
+
+环校验失败时 `order()`、`plan()` 与 `run()`（含 `resume=True`）抛出 `app.TaskCycleError`。它继承自 `ValueError`，因此既有的 `except ValueError` 捕获与异常类型保持兼容；异常对象携带 `cycle` 属性，调用者可直接读取，无需解析文本。
+
+`cycle` 是一个非空的任务名列表，沿"任务 → 直接依赖"边给出实际走出的回路，首节点在末尾重复一次，且列表中不夹带任何回路上的其他节点：
+
+- 自依赖返回 `[name, name]`；
+- 两个节点互相依赖返回 `[a, b, a]`；
+- 多节点环按边的方向完整列出，如 `[a, b, c, a]`。
+
+检测顺序完全确定：以任务名升序依次选取 DFS 起点，每个节点的直接依赖也按名称升序深度优先搜索；当某条边首次回溯到当前 DFS 路径上的节点时，从该节点在路径中的**首次出现处**截取回路。因此同一张图无论注册顺序、`targets` 容器类型、`max_concurrency`、重试预算、`continue_on_error`、`cancel_check` 或 `resume` 参数如何变化，异常类型与 `cycle` 路径逐字一致；图中存在多个回路时只报告该顺序下首个发现的回路。异常文本稳定包含整条路径（`cycle detected: a -> b -> a`），但机器可读信息以 `cycle` 属性为准；该属性为独立副本，修改它不影响后续校验。
+
+校验优先级与既有规则完全一致：缺失依赖仍优先抛出原有的 `KeyError`（即使缺失边与环并存）；参数校验仍先于整图校验。三个入口在校验通过前都不调用任何任务函数——`run()` 不会创建或替换 `execution_state()` 快照与 `execution_trace()` 轨迹，先前的快照和轨迹原样保留；`order()` 与 `plan()` 不改变图结构或任何状态。目标运行仍校验整图：闭包外的环同样抛出 `TaskCycleError`。非环图的优先级拓扑顺序、返回结果键序、任务输入映射及 `TaskExecutionError`、`TaskCancelledError`、`TaskControlError`、`TaskResumeError` 的字段语义均不变。
+
 ## Priority scheduling
 
 `add(name, fn, depends=..., *, priority=n)` 增加一个仅限关键字传入的整数优先级（省略时按 `0` 处理，位置参数解释不变）。优先级允许负数；数值越大越优先，布尔值即使是 `int` 子类也被拒绝（连同浮点数、字符串等非整数一律抛出 `TypeError`）。非法值在任何结构变更前抛出，注册失败不会在图中留下任务、依赖或优先级记录，也不改变最近一次 `execution_state()` 快照；既有的重复名称、空名称、不可调用函数与依赖参数校验结果完全不变。
