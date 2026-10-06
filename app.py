@@ -68,6 +68,28 @@ class TaskResumeError(Exception):
         super().__init__("cannot resume run: %s" % reason)
 
 
+class TaskResourceError(Exception):
+    """Raised when a task declares more of a resource than its limit allows.
+
+    Raised before any task of the run executes, once resource limits are
+    in effect and a task's per-execution request cannot fit even when it
+    holds the whole pool alone. task_name identifies the offending task,
+    resource the resource key, requested the declared units and limit the
+    configured cap. The error never creates or replaces an
+    execution_state snapshot or execution_trace.
+    """
+
+    def __init__(self, task_name, resource, requested, limit):
+        self.task_name = task_name
+        self.resource = resource
+        self.requested = requested
+        self.limit = limit
+        super().__init__(
+            "task %r requests %d of resource %r but its limit is %d"
+            % (task_name, requested, resource, limit)
+        )
+
+
 class TaskCycleError(ValueError):
     """Raised when order(), plan() or run() validate a graph with a cycle.
 
@@ -97,6 +119,11 @@ class TaskGraph:
         self.tasks = {}
         self.deps = defaultdict(set)
         self.priorities = {}
+        # Per-task resource requirements: task name -> mapping of resource
+        # key to the positive integer units each execution holds for the
+        # whole duration of the task (retries included) until the batch
+        # settles. Tasks with no declaration map to an empty dict.
+        self.resources = {}
         self._state = {}
         # Audit trail of the run that established the most recent
         # execution_state snapshot: a priority-topological-ordered list of
@@ -112,9 +139,9 @@ class TaskGraph:
         # change is rejected while the old snapshot stays in place.
         self._state_fingerprint = None
 
-    def add(self, name, fn, depends=(), *, priority=0):
+    def add(self, name, fn, depends=(), *, priority=0, resources=None):
         # Validate everything before mutating anything: a rejected
-        # registration must leave tasks, deps, priorities and
+        # registration must leave tasks, deps, priorities, resources and
         # execution_state untouched.
         if not isinstance(name, str):
             raise TypeError("task name must be a string")
@@ -144,11 +171,49 @@ class TaskGraph:
         # negatives are allowed and the omitted default is 0.
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise TypeError("priority must be an integer")
+        # resources is keyword-only; None (the default) is an empty
+        # requirement. A supplied value must be a mapping of non-empty
+        # string keys to positive integers (booleans rejected as values
+        # even though bool is an int subclass). Fully validated here so a
+        # rejected registration leaves the graph untouched.
+        resource_reqs = self._normalize_resources(resources)
         if name in self.tasks:
             raise ValueError("duplicate task")
         self.tasks[name] = fn
         self.deps[name] = set(dep_names)
         self.priorities[name] = priority
+        self.resources[name] = resource_reqs
+
+    @staticmethod
+    def _normalize_resources(resources):
+        # Validate an add() resources mapping and return an independent
+        # plain dict copy. None means "no requirements"; a supplied value
+        # must be a mapping with non-empty string keys and positive
+        # integer values (booleans rejected). All checks happen before the
+        # graph gains or changes any structure.
+        if resources is None:
+            return {}
+        if not isinstance(resources, Mapping):
+            raise TypeError(
+                "resources must be a mapping of resource names to "
+                "positive integers"
+            )
+        normalized = {}
+        for key, amount in resources.items():
+            if not isinstance(key, str):
+                raise TypeError("resource name must be a string")
+            if not key:
+                raise ValueError("resource name must not be empty")
+            if isinstance(amount, bool) or not isinstance(amount, int):
+                raise TypeError(
+                    "resource requirement must be a positive integer"
+                )
+            if amount <= 0:
+                raise ValueError(
+                    "resource requirement must be a positive integer"
+                )
+            normalized[key] = amount
+        return normalized
 
     def _check_dependencies(self):
         # Dependencies may be registered after the task that names them,
@@ -414,6 +479,73 @@ class TaskGraph:
             raise KeyError("unknown task %r in retry_limits" % unknown[0])
         return limits
 
+    def _normalize_resource_limits(self, resource_limits):
+        # Validate a resource_limits mapping completely before ordering,
+        # execution or snapshot/trace replacement. Keys name resources
+        # declared by at least one registered task; an unknown key raises
+        # KeyError (whole-graph, mirroring retry_limits' task lookup, so a
+        # key for a task outside a targets closure is still legal). Values
+        # are positive integer caps; booleans are rejected even though they
+        # are ints. Declared resources left out of the mapping stay
+        # unbounded. Returns a fresh plain dict.
+        declared = {
+            key
+            for requirements in self.resources.values()
+            for key in requirements
+        }
+        if not isinstance(resource_limits, Mapping):
+            raise TypeError(
+                "resource_limits must be a mapping of resource names to "
+                "positive integers"
+            )
+        caps = {}
+        for key, cap in resource_limits.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    "resource_limits key must be a string"
+                )
+            if isinstance(cap, bool) or not isinstance(cap, int):
+                raise TypeError(
+                    "resource limit must be a positive integer"
+                )
+            if cap <= 0:
+                raise ValueError(
+                    "resource limit must be a positive integer"
+                )
+            caps[key] = cap
+        # An empty key names no declared resource, so it reports here
+        # alongside every other unknown key, deterministically (smallest
+        # first) when several are given.
+        unknown = sorted(key for key in caps if key not in declared)
+        if unknown:
+            raise KeyError(
+                "unknown resource %r in resource_limits" % unknown[0]
+            )
+        return caps
+
+    def _check_resource_feasibility(self, run_order, executable,
+                                    resource_caps):
+        # Before any task executes (and before the snapshot/trace is
+        # replaced), reject a schedule that can never run: a task asks for
+        # more of a capped resource than a whole pool offers, so no batch
+        # could ever admit it. Walked in priority topological order, with
+        # each task's resources in ascending key order, so the reported
+        # task/resource pair is fully deterministic. Only tasks that will
+        # actually execute this run are considered: reused completed nodes
+        # neither run nor hold a unit. Resources absent from resource_caps
+        # are unbounded and never infeasible.
+        for name in run_order:
+            if name not in executable:
+                continue
+            requirements = self.resources[name]
+            for resource in sorted(requirements):
+                requested = requirements[resource]
+                cap = resource_caps.get(resource)
+                if cap is not None and requested > cap:
+                    raise TaskResourceError(
+                        name, resource, requested, cap
+                    )
+
     def plan(self, targets=None):
         """Read-only preview of the priority task sequence run() would cover.
 
@@ -433,7 +565,7 @@ class TaskGraph:
 
     def run(self, max_retries=0, continue_on_error=False, *, targets=None,
             max_concurrency=1, retry_limits=None, cancel_check=None,
-            resume=False):
+            resume=False, resource_limits=None):
         # max_retries is the number of extra attempts granted to each task
         # after its first failure; zero (the default) keeps the historical
         # single-call behavior. Booleans are rejected even though they are
@@ -486,6 +618,17 @@ class TaskGraph:
         limits = {}
         if retry_limits is not None:
             limits = self._normalize_retry_limits(retry_limits)
+        # resource_limits is keyword-only, so the positional interpretation
+        # of the historical arguments never changes. None (the default)
+        # means every declared resource is unbounded, keeping the historical
+        # scheduling semantics exactly. A mapping caps the named resources;
+        # declared resources left out of the mapping stay unbounded. Full
+        # validation happens here, before ordering, execution and
+        # replacement of the previous snapshot, so a rejected mapping leaves
+        # both the graph and the last execution_state untouched.
+        resource_caps = None
+        if resource_limits is not None:
+            resource_caps = self._normalize_resource_limits(resource_limits)
         # targets is keyword-only so the positional interpretation of the
         # historical arguments never changes. None (the default) selects the
         # whole graph; anything else must pass full input validation here,
@@ -512,6 +655,14 @@ class TaskGraph:
                 return {
                     name: self._state[name]["result"] for name in run_order
                 }
+        if resource_caps is not None:
+            # A request that exceeds its cap can never fit a batch, so
+            # reject the run before any task executes and before the
+            # snapshot/trace is replaced. Reused completed nodes neither
+            # run nor hold units this invocation.
+            self._check_resource_feasibility(
+                run_order, set(run_order) - reused, resource_caps
+            )
         # Fresh snapshot for the work this invocation performs. Reused
         # nodes keep a completed record carrying their old result; every
         # other node starts from an empty pending placeholder, so old
@@ -541,6 +692,7 @@ class TaskGraph:
             return self._run_concurrent(
                 run_order, state, trace, max_retries, continue_on_error,
                 max_concurrency, limits, cancel_check, reused,
+                resource_caps,
             )
         results = {
             name: state[name]["result"]
@@ -628,13 +780,20 @@ class TaskGraph:
     def _fingerprint(self):
         # Structural identity of the complete graph at snapshot time:
         # every registered task's name, direct dependencies
-        # (order-normalized) and priority. The fingerprint deliberately
-        # covers the whole graph (not just one targets closure) so that
-        # adding, removing or re-wiring any task — inside or outside
-        # the resumed closure — is a graph change, while a different
+        # (order-normalized), priority and declared resource requirements
+        # (key order-normalized, with their unit amounts). The fingerprint
+        # deliberately covers the whole graph (not just one targets
+        # closure) so that adding, removing or re-wiring any task —
+        # inside or outside the resumed closure — or changing a task's
+        # resource declaration is a graph change, while a different
         # targets closure on an untouched graph is a scope change.
         return frozenset(
-            (name, tuple(sorted(self.deps[name])), self.priorities[name])
+            (
+                name,
+                tuple(sorted(self.deps[name])),
+                self.priorities[name],
+                tuple(sorted(self.resources[name].items())),
+            )
             for name in self.tasks
         )
 
@@ -692,24 +851,38 @@ class TaskGraph:
 
     def _run_concurrent(self, run_order, state, trace, max_retries,
                         continue_on_error, max_concurrency, retry_limits,
-                        cancel_check=None, reused=frozenset()):
+                        cancel_check=None, reused=frozenset(),
+                        resource_caps=None):
         """Batch scheduler used when max_concurrency > 1.
 
-        Each round starts at most max_concurrency ready tasks — those whose
-        direct dependencies all completed successfully — and waits for the
-        whole batch to settle before the next round. run_order already is
-        the priority topological order (largest priority among the ready
+        Each round starts a batch of ready tasks — those whose direct
+        dependencies all completed successfully — and waits for the whole
+        batch to settle before the next round. run_order already is the
+        priority topological order (largest priority among the ready
         nodes, the historical name-ordered FIFO intake on ties), and
-        pending always stays a prefix-filtered view of it, so the first k
-        ready nodes encountered there are exactly the k order() would start
+        pending always stays a prefix-filtered view of it, so the ready
+        nodes encountered there are exactly the ones order() would start
         next; nothing about the batching re-sorts them. Everything
         observable (input mappings, results key order, failure selection,
         state records) follows that priority topological order, never the
         order in which concurrent tasks happen to finish.
 
+        When resource_caps is given, a task also has to fit within the
+        remaining slots of every capped resource to join the batch: ready
+        nodes are walked in priority topological order and admitted while
+        both the task count and the cumulative resource requests stay
+        within the caps. The first ready node that does not fit ends the
+        round — later ready nodes are never reached past it — and its
+        requirements stay pending until the batch releases its holdings.
+        A task's units are held for the whole batch (its retries
+        included) and released only after every task of the batch has
+        settled. Requests above a cap never reach this scheduler: the
+        run() feasibility check raises TaskResourceError first.
+
         On a resumed run, reused nodes are already completed in state:
         their results seed the mapping below, they never enter pending or
-        a batch and therefore never occupy a concurrency slot.
+        a batch and therefore never occupy a concurrency slot or a
+        resource unit.
         """
         position = {name: i for i, name in enumerate(run_order)}
         results = {
@@ -762,8 +935,40 @@ class TaskGraph:
                 if not ready:
                     break  # only unreachable nodes remain
                 # pending stays in run_order (priority topological order),
-                # so the first k ready nodes encountered are precisely the
-                # k order() would start next — no re-sorting here.
+                # so the ready nodes are encountered in precisely the
+                # order order() would start them — no re-sorting here.
+                # Resource-aware packing walks that order and admits a
+                # node only while the task count is below
+                # max_concurrency and the cumulative demand stays within
+                # every capped resource; the first node that would
+                # overflow either bound ends the round, so later ready
+                # nodes are never picked around it. Units stay held until
+                # this whole batch (retries included) settles. The
+                # run-level feasibility check guarantees the first ready
+                # node fits an empty pool, so whenever ready is non-empty
+                # the batch is too.
+                batch = []
+                used = {}
+                for name in ready:
+                    if len(batch) >= max_concurrency:
+                        break
+                    requirements = self.resources[name]
+                    if resource_caps is not None:
+                        overflow = False
+                        for resource, cap in resource_caps.items():
+                            if used.get(resource, 0) + requirements.get(
+                                resource, 0
+                            ) > cap:
+                                overflow = True
+                                break
+                        if overflow:
+                            break
+                        for resource, amount in requirements.items():
+                            if resource in resource_caps:
+                                used[resource] = (
+                                    used.get(resource, 0) + amount
+                                )
+                    batch.append(name)
                 # Cooperative cancellation is consulted exactly once per
                 # batch, in priority topological order, after the previous
                 # batch has fully settled and before any node of this one
@@ -780,7 +985,6 @@ class TaskGraph:
                             run_order, state, trace
                         )
                         raise TaskCancelledError(cancelled)
-                batch = ready[:max_concurrency]
                 launched = set(batch)
                 pending = [
                     n for n in pending if n not in launched and n not in dead
